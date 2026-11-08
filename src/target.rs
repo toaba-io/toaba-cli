@@ -1,0 +1,345 @@
+//! The app a command acts on: `--app` or `TOABA_APP`, else the app set with `toaba app use`, else,
+//! at a terminal, one picked from a list. An app belongs to one org for its whole life, so the app
+//! leads to its org's login. Each login keeps the apps it reaches, so finding an app costs no API
+//! call unless it's new or renamed since.
+
+use std::collections::BTreeMap;
+
+use anyhow::{Context as _, bail};
+
+use crate::{api, auth, config, output, progress, prompt};
+
+#[derive(clap::Args)]
+pub struct AppArg {
+    /// The app, by name or id [default: TOABA_APP, then the app in use]
+    #[arg(long, env = "TOABA_APP")]
+    app: Option<String>,
+}
+
+/// The app a command acts on, and how to reach it.
+pub struct Target {
+    pub client: api::Client,
+    pub app_id: String,
+    /// The app's name, or its id where the CLI doesn't know the name.
+    pub app_name: String,
+}
+
+/// An app one of your logins reaches.
+pub struct Reached {
+    pub org_id: String,
+    pub org_name: String,
+    pub app_id: String,
+    pub app_name: String,
+}
+
+pub async fn app(arg: AppArg) -> anyhow::Result<Target> {
+    if let Some(credential) = auth::from_env() {
+        return from_env(credential, arg.app).await;
+    }
+    let (org_id, app_id) = match arg.app.or(config::app()?) {
+        Some(app) => find(&app).await?,
+        None if prompt::interactive() => {
+            let picked = pick(true).await?;
+            if prompt::confirm(&format!("Use {} from now on?", picked.app_name), true)? {
+                config::use_app(&picked.app_id)?;
+            }
+            (picked.org_id, picked.app_id)
+        }
+        None => bail!("no app given: pass --app, set TOABA_APP, or pick one with `toaba app use`"),
+    };
+
+    let login = config::logins()?
+        .remove(&org_id)
+        .context("the app's login went away, try again")?;
+    let app_name = login
+        .apps
+        .get(&app_id)
+        .cloned()
+        .unwrap_or_else(|| app_id.clone());
+    let credential = auth::for_login(org_id, login).await?;
+    let client = credential.client()?;
+    Ok(Target {
+        client,
+        app_id,
+        app_name,
+    })
+}
+
+/// The app among TOABA_TOKEN's, which are its org's alone. Nothing is remembered: CI says which
+/// app each time.
+async fn from_env(credential: auth::Credential, app: Option<String>) -> anyhow::Result<Target> {
+    let client = credential.client()?;
+    let (app_id, app_name) = match app {
+        Some(app) if is_id(&app) => (app.clone(), app),
+        Some(app) => {
+            let apps = client.apps(&credential.org_id(&client).await?).await?;
+            let found = apps
+                .into_iter()
+                .find(|known| known.name == app)
+                .with_context(|| format!("TOABA_TOKEN reaches no app called {app}"))?;
+            (found.id, found.name)
+        }
+        None if prompt::interactive() => {
+            let mut apps = client.apps(&credential.org_id(&client).await?).await?;
+            if apps.is_empty() {
+                bail!("TOABA_TOKEN reaches no app yet");
+            }
+            let names: Vec<String> = apps.iter().map(|app| app.name.clone()).collect();
+            let picked = apps.swap_remove(prompt::select("Which app?", &names, 0, true)?);
+            (picked.id, picked.name)
+        }
+        None => bail!("no app given: pass --app or set TOABA_APP"),
+    };
+    Ok(Target {
+        client,
+        app_id,
+        app_name,
+    })
+}
+
+/// The org and id of `app`, an app id or name among the apps your logins reach. A miss reads them
+/// all again once, for an app that's new or renamed since.
+pub async fn find(app: &str) -> anyhow::Result<(String, String)> {
+    if let Some(found) = lookup(&reached(&config::logins()?), app)? {
+        return Ok(found);
+    }
+    refresh_all().await;
+    lookup(&reached(&config::logins()?), app)?.with_context(|| {
+        format!("none of your logins reaches an app called {app}, see `toaba app list`")
+    })
+}
+
+/// The org and id of `app` among `apps`. A name is unique within an org but not across orgs, so a
+/// name two orgs use fails, listing their ids. Case counts unless only one name matches without it.
+fn lookup(apps: &[Reached], app: &str) -> anyhow::Result<Option<(String, String)>> {
+    let mut matches: Vec<&Reached> = if is_id(app) {
+        apps.iter().filter(|known| known.app_id == app).collect()
+    } else {
+        let exact: Vec<&Reached> = apps.iter().filter(|known| known.app_name == app).collect();
+        if exact.is_empty() {
+            let wanted = app.to_lowercase();
+            apps.iter()
+                .filter(|known| known.app_name.to_lowercase() == wanted)
+                .collect()
+        } else {
+            exact
+        }
+    };
+    match matches.len() {
+        0 => Ok(None),
+        1 => {
+            let known = matches.remove(0);
+            Ok(Some((known.org_id.clone(), known.app_id.clone())))
+        }
+        n => {
+            let ids: Vec<String> = matches
+                .iter()
+                .map(|known| format!("{} in {}", known.app_id, known.org_name))
+                .collect();
+            bail!(
+                "{n} of your apps are called {app}, pick one by its id: {}",
+                ids.join(", ")
+            )
+        }
+    }
+}
+
+/// Asks which app, among every app your logins reach, starting on the one in use. A picker is
+/// where people look for an app they've just made, so the apps are read fresh. With `report`, the
+/// pick stays on screen.
+pub async fn pick(report: bool) -> anyhow::Result<Reached> {
+    if config::logins()?.is_empty() {
+        bail!("you're not logged in, run `toaba login`");
+    }
+    let line = progress::start("Loading your apps…");
+    refresh_all().await;
+    line.finish_and_clear();
+
+    let mut apps = reached(&config::logins()?);
+    if apps.is_empty() {
+        bail!("none of your logins reaches an app yet, create one in the dashboard");
+    }
+    let width = output::width("", apps.iter().map(|app| &app.app_name));
+    let labels: Vec<String> = apps
+        .iter()
+        .map(|app| format!("{:<width$}  {}", app.app_name, app.org_name))
+        .collect();
+    let in_use = config::app()?;
+    let start = apps
+        .iter()
+        .position(|app| in_use.as_deref() == Some(app.app_id.as_str()))
+        .unwrap_or(0);
+    Ok(apps.swap_remove(prompt::select("Which app?", &labels, start, report)?))
+}
+
+/// Every app your logins reach, by org name and then app name.
+pub fn reached(logins: &BTreeMap<String, config::Login>) -> Vec<Reached> {
+    let mut apps: Vec<Reached> = logins
+        .iter()
+        .flat_map(|(org_id, login)| {
+            login.apps.iter().map(move |(app_id, app_name)| Reached {
+                org_id: org_id.clone(),
+                org_name: login.org_name.clone(),
+                app_id: app_id.clone(),
+                app_name: app_name.clone(),
+            })
+        })
+        .collect();
+    apps.sort_by(|a, b| (&a.org_name, &a.app_name).cmp(&(&b.org_name, &b.app_name)));
+    apps
+}
+
+/// Reads every login's apps again. A login that has ended can't say anything; the others still
+/// can.
+async fn refresh_all() {
+    let Ok(logins) = config::logins() else {
+        return;
+    };
+    for (org_id, login) in logins {
+        let _ = refresh(org_id, login).await;
+    }
+}
+
+/// Reads the apps the login reaches, and keeps them with it.
+pub async fn refresh(org_id: String, login: config::Login) -> anyhow::Result<Vec<api::App>> {
+    let credential = auth::for_login(org_id.clone(), login).await?;
+    let apps = credential.client()?.apps(&org_id).await?;
+    let names = apps.iter().map(|app| (app.id.clone(), app.name.clone()));
+    config::set_apps(&org_id, names.collect())?;
+    Ok(apps)
+}
+
+/// A bucket of an app's assets, written `env/bucket`, such as `staging/assets`. Both parts are ids:
+/// lowercase letters, digits and single hyphens, starting with a letter.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BucketRef {
+    pub environment_id: String,
+    pub bucket_id: String,
+}
+
+impl std::str::FromStr for BucketRef {
+    type Err = String;
+
+    fn from_str(text: &str) -> Result<Self, Self::Err> {
+        match text.split_once('/') {
+            Some((environment, bucket)) if is_slug(environment) && is_slug(bucket) => Ok(Self {
+                environment_id: environment.to_string(),
+                bucket_id: bucket.to_string(),
+            }),
+            _ => Err("write the bucket as env/bucket, such as staging/assets".to_string()),
+        }
+    }
+}
+
+impl std::fmt::Display for BucketRef {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}/{}", self.environment_id, self.bucket_id)
+    }
+}
+
+impl BucketRef {
+    /// Fails unless the app has this bucket, naming the buckets it does have.
+    #[allow(dead_code, reason = "for the assets commands to come")]
+    pub async fn check(&self, target: &Target) -> anyhow::Result<()> {
+        let mut known = Vec::new();
+        for environment in target.client.environments(&target.app_id).await? {
+            for bucket in target
+                .client
+                .buckets(&target.app_id, &environment.id)
+                .await?
+            {
+                if environment.id == self.environment_id && bucket.id == self.bucket_id {
+                    return Ok(());
+                }
+                known.push(format!("{}/{}", environment.id, bucket.id));
+            }
+        }
+        if known.is_empty() {
+            bail!(
+                "{} has no buckets yet, create one in the dashboard",
+                target.app_name
+            );
+        }
+        bail!(
+            "{} has no bucket {self}, it has: {}",
+            target.app_name,
+            known.join(", ")
+        )
+    }
+}
+
+/// An id people choose: a lowercase letter, then lowercase letters and digits in parts joined by
+/// single hyphens, 63 characters at most.
+fn is_slug(text: &str) -> bool {
+    text.len() <= 63
+        && text.starts_with(|first: char| first.is_ascii_lowercase())
+        && text.split('-').all(|part| {
+            !part.is_empty()
+                && part
+                    .chars()
+                    .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit())
+        })
+}
+
+fn is_id(app: &str) -> bool {
+    app.starts_with("app_")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn app(org: &str, id: &str, name: &str) -> Reached {
+        Reached {
+            org_id: format!("org_{org}"),
+            org_name: org.to_string(),
+            app_id: id.to_string(),
+            app_name: name.to_string(),
+        }
+    }
+
+    #[test]
+    fn a_bucket_is_written_env_slash_bucket() {
+        let bucket: BucketRef = "staging/game-assets2".parse().unwrap();
+        assert_eq!(bucket.environment_id, "staging");
+        assert_eq!(bucket.bucket_id, "game-assets2");
+        assert_eq!(bucket.to_string(), "staging/game-assets2");
+
+        for bad in [
+            "assets",
+            "staging/",
+            "/assets",
+            "a/b/c",
+            "Staging/assets",
+            "staging/my--assets",
+            "staging/-a",
+            "1st/assets",
+        ] {
+            assert!(bad.parse::<BucketRef>().is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn an_app_is_found_by_id_or_by_a_name_only_one_app_has() {
+        let apps = [
+            app("a", "app_1", "Space Shooter"),
+            app("a", "app_2", "Puzzle"),
+            app("b", "app_3", "puzzle"),
+            app("b", "app_4", "Tools"),
+            app("c", "app_5", "Tools"),
+        ];
+        let found = |app: &str| lookup(&apps, app).unwrap().map(|(_, id)| id);
+
+        assert_eq!(found("app_4").as_deref(), Some("app_4"));
+        assert_eq!(found("space shooter").as_deref(), Some("app_1"));
+        assert_eq!(found("puzzle").as_deref(), Some("app_3"));
+        assert_eq!(found("Nope"), None);
+        assert!(lookup(&apps, "PUZZLE").is_err());
+
+        let shared = lookup(&apps, "Tools").unwrap_err().to_string();
+        assert!(
+            shared.contains("app_4 in b") && shared.contains("app_5 in c"),
+            "{shared}"
+        );
+    }
+}
