@@ -59,6 +59,9 @@ pub enum Command {
         /// Notes to keep with the release
         #[arg(long, requires = "release")]
         notes: Option<String>,
+        /// Point this tag at the new release, creating or moving it; repeatable
+        #[arg(long, requires = "release", value_parser = tag_name)]
+        tag: Vec<String>,
     },
 }
 
@@ -186,6 +189,7 @@ pub async fn run(command: Command, output: Output) -> anyhow::Result<()> {
             concurrency,
             release,
             notes,
+            tag,
         } => {
             let options = SyncOptions {
                 dry_run,
@@ -194,6 +198,7 @@ pub async fn run(command: Command, output: Output) -> anyhow::Result<()> {
                 concurrency: concurrency.into(),
                 release,
                 notes,
+                tags: tag,
             };
             sync(dir, bucket, app, options, output).await
         }
@@ -207,6 +212,7 @@ struct SyncOptions {
     concurrency: usize,
     release: Option<String>,
     notes: Option<String>,
+    tags: Vec<String>,
 }
 
 async fn sync(
@@ -216,6 +222,9 @@ async fn sync(
     options: SyncOptions,
     output: Output,
 ) -> anyhow::Result<()> {
+    if options.tags.iter().any(|tag| tag == "latest") {
+        bail!("latest follows new releases by itself and can't be set");
+    }
     // Asked for up front, before any work, where there'd be nobody to confirm later.
     if !options.dry_run && !options.yes && !prompt::interactive() {
         bail!("sync changes the bucket: pass --yes to go ahead, or --dry-run to only look");
@@ -256,7 +265,13 @@ async fn sync(
 
     if applies {
         let question = match &options.release {
-            Some(name) => format!("Sync {bucket} like this, and release it as {name}?"),
+            Some(name) if options.tags.is_empty() => {
+                format!("Sync {bucket} like this, and release it as {name}?")
+            }
+            Some(name) => format!(
+                "Sync {bucket} like this, release it as {name}, and point {} at it?",
+                options.tags.join(", ")
+            ),
             None => format!("Sync {bucket} like this?"),
         };
         prompt::confirm_or_yes(&question, options.yes)?;
@@ -285,6 +300,7 @@ async fn sync(
     // The release takes whatever the bucket holds unreleased, also from an earlier sync. A sync
     // that was just confirmed covers it; otherwise it asks for itself.
     let mut release = None;
+    let mut tags = Vec::new();
     if let (Some(name), false) = (&options.release, options.dry_run) {
         let confirmed = options.yes || applies;
         release = cut_release(
@@ -292,12 +308,20 @@ async fn sync(
             &bucket,
             name,
             options.notes.as_deref(),
+            &options.tags,
             confirmed,
             applies,
         )
         .await?;
-        if release.is_none() {
-            eprintln!("Nothing new to release: {bucket} matches its latest release");
+        match &release {
+            Some(release) => tags = point_tags(&target, &bucket, &options.tags, release).await?,
+            None if options.tags.is_empty() => {
+                eprintln!("Nothing new to release: {bucket} matches its latest release");
+            }
+            None => eprintln!(
+                "Nothing new to release: {bucket} matches its latest release, so {} stays",
+                options.tags.join(", ")
+            ),
         }
     }
     if output == Output::Json {
@@ -305,6 +329,7 @@ async fn sync(
             "bucket": bucket.to_string(),
             "applied": applies,
             "release": release,
+            "tags": tags,
             "new": plan.new,
             "changed": plan.changed,
             "removed": plan.removed,
@@ -395,7 +420,8 @@ async fn create_release(
         .inspect_err(|_| progress::failed(&line, "Reading the bucket"))?;
     line.finish_and_clear();
 
-    let Some(release) = cut_release(&target, &bucket, &name, notes.as_deref(), yes, false).await?
+    let Some(release) =
+        cut_release(&target, &bucket, &name, notes.as_deref(), &[], yes, false).await?
     else {
         bail!("{bucket} has nothing new to release: its files match the latest release");
     };
@@ -403,6 +429,46 @@ async fn create_release(
         print_json(&release)?;
     }
     Ok(())
+}
+
+/// Points each tag at the release just cut, creating the tag or moving it.
+async fn point_tags(
+    target: &target::Target,
+    bucket: &BucketRef,
+    tags: &[String],
+    release: &api::Release,
+) -> anyhow::Result<Vec<api::Tag>> {
+    if tags.is_empty() {
+        return Ok(Vec::new());
+    }
+    let path = api::bucket_path(&target.app_id, &bucket.environment_id, &bucket.bucket_id);
+    let line = progress::start("Setting the tags…");
+    let set = async {
+        let current = target.client.tags(&path).await?;
+        let mut set = Vec::new();
+        for tag in tags {
+            let revision = current.iter().find(|c| &c.id == tag).map(|c| c.revision);
+            let moved = target
+                .client
+                .set_tag(&path, tag, &release.id, revision)
+                .await
+                .with_context(|| format!("couldn't point {tag} at #{}", release.release_num))?;
+            set.push(moved);
+        }
+        anyhow::Ok(set)
+    }
+    .await
+    .inspect_err(|_| progress::failed(&line, "Setting the tags"))?;
+    line.finish_and_clear();
+    for tag in &set {
+        eprintln!(
+            "{} {} now points at #{} in {bucket}",
+            theme::accent().apply_to("✓"),
+            style(&tag.id).bold().for_stderr(),
+            release.release_num
+        );
+    }
+    Ok(set)
 }
 
 /// Cuts a release of the bucket's files as they are now, after showing what it holds and asking,
@@ -413,6 +479,7 @@ async fn cut_release(
     bucket: &BucketRef,
     name: &str,
     notes: Option<&str>,
+    tags: &[String],
     confirmed: bool,
     shown: bool,
 ) -> anyhow::Result<Option<api::Release>> {
@@ -446,7 +513,12 @@ async fn cut_release(
                 .for_stderr()
         );
     }
-    prompt::confirm_or_yes("Cut this release?", confirmed)?;
+    let question = if tags.is_empty() {
+        "Cut this release?".to_string()
+    } else {
+        format!("Cut this release, and point {} at it?", tags.join(", "))
+    };
+    prompt::confirm_or_yes(&question, confirmed)?;
 
     let line = progress::start("Cutting the release…");
     let release = target
