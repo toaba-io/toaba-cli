@@ -153,6 +153,9 @@ pub(super) async fn run(args: Args, output: Output) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// How many changes of each kind a plan lists before it says how many more there are.
+const LISTED: usize = 20;
+
 /// The plan's changes, a line each, then its summary; coloured for stdout or for stderr.
 fn plan_text(plan: &mirror::Plan, stdout: bool) -> String {
     let paint = |style: console::Style, text: &str| {
@@ -169,7 +172,12 @@ fn plan_text(plan: &mirror::Plan, stdout: bool) -> String {
         (paint(theme::accent(), "~"), &plan.changed, "changed"),
         (paint(theme::failure(), "-"), &plan.removed, "to remove"),
     ];
-    let all = || groups.iter().flat_map(|(_, changes, _)| changes.iter());
+    // A long plan shows the first of each kind: the summary has the counts, and JSON the rest.
+    let all = || {
+        groups
+            .iter()
+            .flat_map(|(_, changes, _)| changes.iter().take(LISTED))
+    };
     let path_width = width("", all().map(|change| &change.path));
     let sizes: Vec<String> = all()
         .map(|change| HumanBytes(change.size_bytes).to_string())
@@ -178,13 +186,17 @@ fn plan_text(plan: &mirror::Plan, stdout: bool) -> String {
 
     let mut text = String::new();
     for (mark, changes, what) in &groups {
-        for change in changes.iter() {
+        for change in changes.iter().take(LISTED) {
             text.push_str(&format!(
                 "  {mark} {}  {:>size_width$}  {}\n",
                 pad(&plain(&change.path), path_width),
                 HumanBytes(change.size_bytes).to_string(),
                 dim(what)
             ));
+        }
+        if changes.len() > LISTED {
+            let more = format!("… and {} more {what}", changes.len() - LISTED);
+            text.push_str(&format!("  {mark} {}\n", dim(&more)));
         }
     }
     if plan.is_empty() {
@@ -203,4 +215,29 @@ fn plan_text(plan: &mirror::Plan, stdout: bool) -> String {
         ));
     }
     text
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_long_plan_lists_the_first_of_each_kind_and_counts_the_rest() {
+        let change = |n: usize| mirror::Change {
+            path: format!("file-{n:03}.txt"),
+            size_bytes: 1,
+        };
+        let plan = mirror::Plan {
+            new: (0..LISTED + 5).map(change).collect(),
+            removed: (0..3).map(change).collect(),
+            ..Default::default()
+        };
+        let text = plan_text(&plan, true);
+
+        assert_eq!(text.matches(" new\n").count(), LISTED + 1);
+        assert!(text.contains("… and 5 more new"));
+        assert!(!text.contains("file-020.txt"));
+        assert_eq!(text.matches("to remove\n").count(), 3);
+        assert!(text.contains("25 new, 0 changed, 3 to remove"));
+    }
 }
