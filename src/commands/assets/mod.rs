@@ -1,6 +1,7 @@
 //! `toaba assets`: an app's files, in the buckets of its environments, as Unity's `ugs ccd`. The CLI
 //! covers what each build does; setting environments and buckets up stays in the dashboard.
 
+mod branch;
 mod bucket;
 mod promote;
 mod release;
@@ -39,6 +40,22 @@ pub enum Command {
     /// Uploads the files that are new or changed and removes the ones no longer in
     /// the folder. Players aren't affected until a release is tagged.
     Sync(sync::Args),
+    /// A bucket per branch or pull request, to try its content before it's merged
+    Branch {
+        #[command(subcommand)]
+        command: BranchCommand,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum BranchCommand {
+    /// Make a branch's bucket match a local folder, and release it
+    ///
+    /// The bucket is branches/<branch>, created the first time with the environment.
+    /// With --from, a new branch starts from that bucket's latest release, so only
+    /// the files that differ are uploaded. Each sync cuts a release, which the
+    /// bucket's latest tag follows. Run it again on every push.
+    Sync(branch::SyncArgs),
 }
 
 #[derive(Subcommand)]
@@ -88,5 +105,8 @@ pub async fn run(command: Command, output: Output) -> anyhow::Result<()> {
         },
         Command::Promote(args) => promote::run(args, output).await,
         Command::Sync(args) => sync::run(args, output).await,
+        Command::Branch {
+            command: BranchCommand::Sync(args),
+        } => branch::sync(args, output).await,
     }
 }

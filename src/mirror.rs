@@ -174,12 +174,13 @@ fn sha256(path: &Path, progress: &ProgressBar) -> anyhow::Result<String> {
         .collect())
 }
 
-/// How the local files differ from the bucket's.
-pub fn plan(local: &[LocalFile], remote: &[api::Entry]) -> Plan {
-    let mut remote: BTreeMap<&str, &api::Version> = remote
-        .iter()
-        .filter_map(|entry| Some((entry.path.as_str(), entry.current_version.as_ref()?)))
-        .collect();
+/// How the local files differ from the remote ones, each a path and its content: a bucket's
+/// files, or the release a new bucket will start from.
+pub fn plan<'a>(
+    local: &[LocalFile],
+    remote: impl IntoIterator<Item = (&'a str, &'a api::Version)>,
+) -> Plan {
+    let mut remote: BTreeMap<&str, &api::Version> = remote.into_iter().collect();
     let mut plan = Plan::default();
     for file in local {
         let change = || Change {
@@ -549,6 +550,12 @@ mod tests {
 
     #[test]
     fn a_plan_sorts_files_into_new_changed_removed_and_unchanged() {
+        let remote = [
+            remote("same.txt", "bb", "text/plain"),
+            remote("edited.txt", "00", "text/plain"),
+            remote("retyped.json", "dd", "text/plain"),
+            remote("gone.txt", "ee", "text/plain"),
+        ];
         let plan = plan(
             &[
                 local("new.txt", "aa", "text/plain"),
@@ -556,12 +563,7 @@ mod tests {
                 local("edited.txt", "cc", "text/plain"),
                 local("retyped.json", "dd", "application/json"),
             ],
-            &[
-                remote("same.txt", "bb", "text/plain"),
-                remote("edited.txt", "00", "text/plain"),
-                remote("retyped.json", "dd", "text/plain"),
-                remote("gone.txt", "ee", "text/plain"),
-            ],
+            remote.iter().filter_map(api::Entry::file),
         );
 
         let paths = |changes: &[Change]| -> Vec<String> {

@@ -5,6 +5,7 @@ use std::collections::BTreeMap;
 
 use anyhow::Context as _;
 use chrono::{DateTime, Utc};
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
 use super::{Client, Page};
@@ -21,6 +22,37 @@ impl Client {
         self.get(&format!(
             "/storage/v1/apps/{app_id}/environments/{environment_id}/buckets"
         ))
+        .await
+    }
+
+    /// Creates an environment with this id. One that exists already answers `environment_exists`.
+    pub async fn create_environment(
+        &self,
+        app_id: &str,
+        environment_id: &str,
+        name: &str,
+    ) -> anyhow::Result<Environment> {
+        self.post(
+            &format!("/storage/v1/apps/{app_id}/environments?environment_id={environment_id}"),
+            &serde_json::json!({ "name": name }),
+        )
+        .await
+    }
+
+    /// Creates an open bucket with this id, named after it. One that exists already answers
+    /// `bucket_exists`, and a missing environment `not_found`.
+    pub async fn create_bucket(
+        &self,
+        app_id: &str,
+        environment_id: &str,
+        bucket_id: &str,
+    ) -> anyhow::Result<Bucket> {
+        self.post(
+            &format!(
+                "/storage/v1/apps/{app_id}/environments/{environment_id}/buckets?bucket_id={bucket_id}"
+            ),
+            &serde_json::json!({ "name": bucket_id }),
+        )
         .await
     }
 
@@ -42,21 +74,37 @@ pub struct BucketApi<'a> {
 }
 
 impl BucketApi<'_> {
-    /// Every file in the bucket, by path, read a thousand at a time.
+    /// Every file in the bucket, by path.
     pub async fn entries(&self) -> anyhow::Result<Vec<Entry>> {
-        let path = format!("{}/entries", self.path);
-        let mut entries = Vec::new();
+        self.every(&format!("{}/entries", self.path), &[("recursive", "true")])
+            .await
+    }
+
+    /// Every file a release of the bucket holds, by path.
+    pub async fn release_files(&self, release_id: &str) -> anyhow::Result<Vec<ReleaseFile>> {
+        self.every(&format!("{}/releases/{release_id}/entries", self.path), &[])
+            .await
+    }
+
+    /// Every item of a list, read a thousand at a time.
+    async fn every<T: DeserializeOwned>(
+        &self,
+        path: &str,
+        query: &[(&str, &str)],
+    ) -> anyhow::Result<Vec<T>> {
+        let mut items = Vec::new();
         let mut page_token: Option<String> = None;
         loop {
-            let mut query = vec![("recursive", "true"), ("page_size", "1000")];
+            let mut page_query = query.to_vec();
+            page_query.push(("page_size", "1000"));
             if let Some(token) = &page_token {
-                query.push(("page_token", token));
+                page_query.push(("page_token", token));
             }
-            let page: Page<Entry> = self.client.get_whole(&path, &query).await?;
-            entries.extend(page.data);
+            let page: Page<T> = self.client.get_whole(path, &page_query).await?;
+            items.extend(page.data);
             match page.next_page_token {
                 Some(token) => page_token = Some(token),
-                None => return Ok(entries),
+                None => return Ok(items),
             }
         }
     }
@@ -285,6 +333,28 @@ pub struct Entry {
     /// Echoed when changing or removing the file, so a change made meanwhile isn't overwritten.
     pub revision: u64,
     pub current_version: Option<Version>,
+}
+
+impl Entry {
+    /// Its path and content, if it has content.
+    pub fn file(&self) -> Option<(&str, &Version)> {
+        Some((&self.path, self.current_version.as_ref()?))
+    }
+}
+
+/// A file as a release holds it.
+#[derive(Debug, Deserialize)]
+pub struct ReleaseFile {
+    #[serde(deserialize_with = "super::plain")]
+    pub path: String,
+    pub version: Version,
+}
+
+impl ReleaseFile {
+    /// Its path and content.
+    pub fn file(&self) -> (&str, &Version) {
+        (&self.path, &self.version)
+    }
 }
 
 /// The content of a file.

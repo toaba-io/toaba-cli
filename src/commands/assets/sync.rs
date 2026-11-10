@@ -11,8 +11,8 @@ use super::release::{CutRelease, cut_release};
 use super::tag::{point_tags, tag_name};
 use crate::output::{Output, pad, plain, print_json, width};
 use crate::prompt::YesArg;
-use crate::target::{self, AppArg, BucketRef};
-use crate::{mirror, progress, theme};
+use crate::target::{self, AppArg, Bucket, BucketRef};
+use crate::{api, mirror, progress, theme};
 
 #[derive(clap::Args)]
 pub struct Args {
@@ -22,17 +22,10 @@ pub struct Args {
     bucket: BucketRef,
     #[command(flatten)]
     app: AppArg,
-    /// Show what would change, and change nothing
-    #[arg(long)]
-    dry_run: bool,
-    /// Leave out local files matching this pattern, such as '*.meta'; repeatable
-    #[arg(long, value_name = "GLOB")]
-    exclude: Vec<String>,
+    #[command(flatten)]
+    folder: FolderArgs,
     #[command(flatten)]
     yes: YesArg,
-    /// How many files to upload at once
-    #[arg(long, default_value_t = 8, value_parser = clap::value_parser!(u8).range(1..=32))]
-    concurrency: u8,
     /// After syncing, cut a release with this name, such as v1.4
     #[arg(long, value_name = "NAME")]
     release: Option<String>,
@@ -44,15 +37,32 @@ pub struct Args {
     tag: Vec<String>,
 }
 
+/// The options of a command that mirrors a local folder into a bucket.
+#[derive(clap::Args)]
+pub(super) struct FolderArgs {
+    /// Show what would change, and change nothing
+    #[arg(long)]
+    pub dry_run: bool,
+    /// Leave out local files matching this pattern, such as '*.meta'; repeatable
+    #[arg(long, value_name = "GLOB")]
+    pub exclude: Vec<String>,
+    /// How many files to upload at once
+    #[arg(long, default_value_t = 8, value_parser = clap::value_parser!(u8).range(1..=32))]
+    pub concurrency: u8,
+}
+
 pub(super) async fn run(args: Args, output: Output) -> anyhow::Result<()> {
     let Args {
         dir,
         bucket,
         app: arg,
-        dry_run,
-        exclude,
+        folder:
+            FolderArgs {
+                dry_run,
+                exclude,
+                concurrency,
+            },
         yes,
-        concurrency,
         release: release_name,
         notes,
         tag: tag_names,
@@ -71,23 +81,10 @@ pub(super) async fn run(args: Args, output: Output) -> anyhow::Result<()> {
     })
     .await?;
 
-    let total: u64 = files.iter().map(|(_, _, size)| size).sum();
-    let bar = progress::bar(total, "Hashing");
-    let local = tokio::task::spawn_blocking({
-        let bar = bar.clone();
-        move || mirror::hash(files, &bar)
-    })
-    .await??;
-    bar.finish_and_clear();
-
-    let plan = mirror::plan(&local, &remote);
+    let local = hash(files).await?;
+    let plan = mirror::plan(&local, remote.iter().filter_map(api::Entry::file));
     let applies = !dry_run && !plan.is_empty();
-    // With -o json the plan is still shown to the person asked to confirm, on stderr.
-    if output == Output::Text {
-        print!("{}", plan_text(&plan, true));
-    } else if applies && !yes.yes {
-        eprint!("{}", plan_text(&plan, false));
-    }
+    show_plan(&plan, output, applies && !yes.yes);
 
     if let (true, Output::Text, Some(name)) = (dry_run, output, &release_name) {
         // What the bucket holds unreleased isn't read in a dry run, so this can't say whether
@@ -113,17 +110,15 @@ pub(super) async fn run(args: Args, output: Output) -> anyhow::Result<()> {
             None => format!("Sync {bucket} like this?"),
         };
         yes.confirm(&question)?;
-        let bar = progress::bar(plan.upload_bytes(), "Uploading");
-        mirror::apply(&bucket, &local, &remote, &plan, concurrency.into(), &bar)
-            .await
-            .inspect_err(|_| bar.abandon())?;
-        bar.finish_and_clear();
-        eprintln!(
-            "{} Synced {} in {}",
-            theme::accent().apply_to("✓"),
-            style(&bucket.name).bold().for_stderr(),
-            target.app_name
-        );
+        upload(
+            &bucket,
+            &local,
+            &remote,
+            &plan,
+            concurrency,
+            &target.app_name,
+        )
+        .await?;
     }
 
     // The release takes whatever the bucket holds unreleased, also from an earlier sync. A sync
@@ -151,19 +146,78 @@ pub(super) async fn run(args: Args, output: Output) -> anyhow::Result<()> {
         }
     }
     if output == Output::Json {
-        print_json(&json!({
-            "bucket": bucket.to_string(),
-            "applied": applies,
-            "release": release,
-            "tags": tags,
-            "new": plan.new,
-            "changed": plan.changed,
-            "removed": plan.removed,
-            "unchanged_count": plan.unchanged_count,
-            "upload_bytes": plan.upload_bytes(),
-        }))?;
+        print_json(&with_plan(
+            &plan,
+            json!({
+                "bucket": bucket.to_string(),
+                "applied": applies,
+                "release": release,
+                "tags": tags,
+            }),
+        ))?;
     }
     Ok(())
+}
+
+/// The scanned files, hashed, behind a bar of the bytes read.
+pub(super) async fn hash(
+    files: Vec<(String, PathBuf, u64)>,
+) -> anyhow::Result<Vec<mirror::LocalFile>> {
+    let total: u64 = files.iter().map(|(_, _, size)| size).sum();
+    let bar = progress::bar(total, "Hashing");
+    let local = tokio::task::spawn_blocking({
+        let bar = bar.clone();
+        move || mirror::hash(files, &bar)
+    })
+    .await??;
+    bar.finish_and_clear();
+    Ok(local)
+}
+
+/// Shows the plan: on stdout as the result, or with -o json on stderr, for the person `asking`.
+pub(super) fn show_plan(plan: &mirror::Plan, output: Output, asking: bool) {
+    if output == Output::Text {
+        print!("{}", plan_text(plan, true));
+    } else if asking {
+        eprint!("{}", plan_text(plan, false));
+    }
+}
+
+/// Makes the bucket match the plan behind a bar of the bytes sent, then says so.
+pub(super) async fn upload(
+    bucket: &Bucket<'_>,
+    local: &[mirror::LocalFile],
+    remote: &[api::Entry],
+    plan: &mirror::Plan,
+    concurrency: u8,
+    app_name: &str,
+) -> anyhow::Result<()> {
+    let bar = progress::bar(plan.upload_bytes(), "Uploading");
+    mirror::apply(bucket, local, remote, plan, concurrency.into(), &bar)
+        .await
+        .inspect_err(|_| bar.abandon())?;
+    bar.finish_and_clear();
+    eprintln!(
+        "{} Synced {} in {app_name}",
+        theme::accent().apply_to("✓"),
+        style(&bucket.name).bold().for_stderr(),
+    );
+    Ok(())
+}
+
+/// A command's JSON result: `fields`, and the plan's lists and counts.
+pub(super) fn with_plan(plan: &mirror::Plan, fields: serde_json::Value) -> serde_json::Value {
+    let mut result = json!({
+        "new": plan.new,
+        "changed": plan.changed,
+        "removed": plan.removed,
+        "unchanged_count": plan.unchanged_count,
+        "upload_bytes": plan.upload_bytes(),
+    });
+    if let (Some(result), serde_json::Value::Object(fields)) = (result.as_object_mut(), fields) {
+        result.extend(fields);
+    }
+    result
 }
 
 /// How many changes of each kind a plan lists before it says how many more there are.

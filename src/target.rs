@@ -71,32 +71,9 @@ impl std::fmt::Display for Bucket<'_> {
 impl Target {
     /// The app's bucket. Fails when the app has none by that name, naming the ones it has.
     pub async fn bucket(&self, name: &BucketRef) -> anyhow::Result<Bucket<'_>> {
-        // An unknown environment answers not found, which the walk below turns into the list.
-        let in_environment = match self
-            .client
-            .buckets(&self.app_id, &name.environment_id)
-            .await
-        {
-            Ok(buckets) => buckets,
-            Err(err)
-                if err
-                    .downcast_ref::<api::Error>()
-                    .is_some_and(|e| e.is("not_found")) =>
-            {
-                Vec::new()
-            }
-            Err(err) => return Err(err),
-        };
-        if let Some(info) = in_environment.into_iter().find(|b| b.id == name.bucket_id) {
-            return Ok(Bucket {
-                api: self
-                    .client
-                    .bucket(&self.app_id, &name.environment_id, &name.bucket_id),
-                name: name.clone(),
-                info,
-            });
+        if let Some(bucket) = self.find_bucket(name).await? {
+            return Ok(bucket);
         }
-
         let known: Vec<String> = self
             .buckets()
             .await?
@@ -114,6 +91,61 @@ impl Target {
             self.app_name,
             known.join(", ")
         )
+    }
+
+    /// The app's bucket, if it has one by that name, in an environment it may not have.
+    pub async fn find_bucket(&self, name: &BucketRef) -> anyhow::Result<Option<Bucket<'_>>> {
+        let in_environment = match self
+            .client
+            .buckets(&self.app_id, &name.environment_id)
+            .await
+        {
+            Ok(buckets) => buckets,
+            Err(err) if api::answered(&err, "not_found") => Vec::new(),
+            Err(err) => return Err(err),
+        };
+        Ok(in_environment
+            .into_iter()
+            .find(|bucket| bucket.id == name.bucket_id)
+            .map(|info| self.known(name, info)))
+    }
+
+    /// Creates the bucket, and its environment, called `environment_name`, if the app has none by
+    /// that id. One made meanwhile, by another run of the same pipeline say, will do as well.
+    pub async fn create_bucket(
+        &self,
+        name: &BucketRef,
+        environment_name: &str,
+    ) -> anyhow::Result<Bucket<'_>> {
+        let (app, environment, bucket) = (&self.app_id, &name.environment_id, &name.bucket_id);
+        let created = match self.client.create_bucket(app, environment, bucket).await {
+            Err(err) if api::answered(&err, "not_found") => {
+                match self
+                    .client
+                    .create_environment(app, environment, environment_name)
+                    .await
+                {
+                    Err(err) if !api::answered(&err, "environment_exists") => return Err(err),
+                    _ => self.client.create_bucket(app, environment, bucket).await,
+                }
+            }
+            created => created,
+        };
+        match created {
+            Ok(info) => Ok(self.known(name, info)),
+            Err(err) if api::answered(&err, "bucket_exists") => self.bucket(name).await,
+            Err(err) => Err(err),
+        }
+    }
+
+    fn known(&self, name: &BucketRef, info: api::Bucket) -> Bucket<'_> {
+        Bucket {
+            api: self
+                .client
+                .bucket(&self.app_id, &name.environment_id, &name.bucket_id),
+            name: name.clone(),
+            info,
+        }
     }
 
     /// Every bucket of the app, with its environment, by environment and then bucket.
@@ -406,5 +438,115 @@ mod tests {
             shared.contains("app_4 in b") && shared.contains("app_5 in c"),
             "{shared}"
         );
+    }
+
+    mod creating {
+        use serde_json::json;
+        use wiremock::matchers::{body_json, method, path, query_param};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        use super::*;
+
+        const ENVIRONMENTS: &str = "/storage/v1/apps/app_a/environments";
+        const BUCKETS: &str = "/storage/v1/apps/app_a/environments/branches/buckets";
+
+        async fn target(server: &MockServer) -> Target {
+            Target {
+                client: api::testing::client(server).await,
+                app_id: "app_a".into(),
+                app_name: "Space Shooter".into(),
+            }
+        }
+
+        fn bucket() -> serde_json::Value {
+            json!({ "id": "pr-1", "name": "pr-1", "write_access": "open", "release_count": 0,
+                "unreleased_count": 0, "tags": [] })
+        }
+
+        fn refused(status: u16, code: &str) -> ResponseTemplate {
+            ResponseTemplate::new(status).set_body_json(json!({ "error": code }))
+        }
+
+        #[tokio::test]
+        async fn a_bucket_in_a_missing_environment_comes_with_the_environment() {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path(BUCKETS))
+                .and(query_param("bucket_id", "pr-1"))
+                .respond_with(refused(404, "not_found"))
+                .up_to_n_times(1)
+                .mount(&server)
+                .await;
+            Mock::given(method("POST"))
+                .and(path(ENVIRONMENTS))
+                .and(query_param("environment_id", "branches"))
+                .and(body_json(json!({ "name": "Branches" })))
+                .respond_with(ResponseTemplate::new(201).set_body_json(json!({
+                    "data": { "id": "branches", "name": "Branches" }
+                })))
+                .expect(1)
+                .mount(&server)
+                .await;
+            Mock::given(method("POST"))
+                .and(path(BUCKETS))
+                .and(body_json(json!({ "name": "pr-1" })))
+                .respond_with(ResponseTemplate::new(201).set_body_json(json!({ "data": bucket() })))
+                .expect(1)
+                .mount(&server)
+                .await;
+
+            let target = target(&server).await;
+            let name: BucketRef = "branches/pr-1".parse().unwrap();
+            let created = target.create_bucket(&name, "Branches").await.unwrap();
+            assert_eq!(created.info.id, "pr-1");
+        }
+
+        #[tokio::test]
+        async fn a_bucket_another_run_just_created_will_do() {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path(BUCKETS))
+                .respond_with(refused(409, "bucket_exists"))
+                .mount(&server)
+                .await;
+            Mock::given(method("POST"))
+                .and(path(ENVIRONMENTS))
+                .respond_with(refused(500, "internal_error"))
+                .expect(0)
+                .mount(&server)
+                .await;
+            Mock::given(method("GET"))
+                .and(path(BUCKETS))
+                .respond_with(
+                    ResponseTemplate::new(200).set_body_json(json!({ "data": [bucket()] })),
+                )
+                .mount(&server)
+                .await;
+
+            let target = target(&server).await;
+            let name: BucketRef = "branches/pr-1".parse().unwrap();
+            let found = target.create_bucket(&name, "Branches").await.unwrap();
+            assert_eq!(found.to_string(), "branches/pr-1");
+        }
+
+        #[tokio::test]
+        async fn a_full_environment_is_a_failure() {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path(BUCKETS))
+                .respond_with(refused(409, "too_many_buckets"))
+                .mount(&server)
+                .await;
+
+            let target = target(&server).await;
+            let name: BucketRef = "branches/pr-1".parse().unwrap();
+            let Err(err) = target.create_bucket(&name, "Branches").await else {
+                panic!("a full environment takes no bucket");
+            };
+            assert_eq!(
+                err.to_string(),
+                "the environment holds 1,000 buckets, the most it can"
+            );
+        }
     }
 }

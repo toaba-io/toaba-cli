@@ -329,6 +329,11 @@ impl Error {
     }
 }
 
+/// Whether `err` is an error answer with this code.
+pub fn answered(err: &anyhow::Error, code: &str) -> bool {
+    err.downcast_ref::<Error>().is_some_and(|err| err.is(code))
+}
+
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self.code.as_deref() {
@@ -373,6 +378,9 @@ impl fmt::Display for Error {
                     _ => f.write_str("the org's storage is full"),
                 }
             }
+            Some("too_many_buckets") => {
+                f.write_str("the environment holds 1,000 buckets, the most it can")
+            }
             Some("scheduled_for_deletion") => {
                 f.write_str("it's scheduled for deletion, so it can't change until it's restored")
             }
@@ -409,9 +417,9 @@ fn plain_opt<'de, D: serde::Deserializer<'de>>(
     Ok(text.map(|text| crate::output::plain(&text)))
 }
 
-/// What the API tests share.
+/// What tests calling the API share.
 #[cfg(test)]
-mod testing {
+pub mod testing {
     use wiremock::MockServer;
 
     use super::Client;
