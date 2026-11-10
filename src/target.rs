@@ -95,19 +95,20 @@ impl Target {
 
     /// The app's bucket, if it has one by that name, in an environment it may not have.
     pub async fn find_bucket(&self, name: &BucketRef) -> anyhow::Result<Option<Bucket<'_>>> {
-        let in_environment = match self
-            .client
-            .buckets(&self.app_id, &name.environment_id)
-            .await
-        {
-            Ok(buckets) => buckets,
-            Err(err) if api::answered(&err, "not_found") => Vec::new(),
-            Err(err) => return Err(err),
-        };
-        Ok(in_environment
+        Ok(self
+            .buckets_in(&name.environment_id)
+            .await?
             .into_iter()
             .find(|bucket| bucket.id == name.bucket_id)
             .map(|info| self.known(name, info)))
+    }
+
+    /// The buckets of an environment, by name: none if the app has no such environment.
+    pub async fn buckets_in(&self, environment_id: &str) -> anyhow::Result<Vec<api::Bucket>> {
+        match self.client.buckets(&self.app_id, environment_id).await {
+            Err(err) if api::answered(&err, "not_found") => Ok(Vec::new()),
+            listed => listed,
+        }
     }
 
     /// Creates the bucket, and its environment, called `environment_name`, if the app has none by

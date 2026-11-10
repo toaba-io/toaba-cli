@@ -11,7 +11,7 @@ use serde_json::json;
 use super::release::{CutRelease, cut_release, release_label, release_size};
 use super::sync::{FolderArgs, hash, show_plan, upload, with_plan};
 use super::tag::LATEST;
-use crate::output::{Output, print_json};
+use crate::output::{Output, date, print_json, table};
 use crate::prompt::YesArg;
 use crate::target::{self, AppArg, Bucket, BucketRef, Target};
 use crate::{api, mirror, progress, theme};
@@ -56,6 +56,12 @@ pub struct SyncArgs {
     folder: FolderArgs,
     #[command(flatten)]
     yes: YesArg,
+}
+
+#[derive(clap::Args)]
+pub struct ListArgs {
+    #[command(flatten)]
+    app: AppArg,
 }
 
 #[derive(clap::Args)]
@@ -249,6 +255,67 @@ pub(super) async fn sync(args: SyncArgs, output: Output) -> anyhow::Result<()> {
     Ok(())
 }
 
+pub(super) async fn list(args: ListArgs, output: Output) -> anyhow::Result<()> {
+    // Found before the spinner starts, since finding it may ask which app.
+    let target = target::app(args.app).await?;
+    let mut branches =
+        progress::during("Loading the branches…", target.buckets_in(ENVIRONMENT)).await?;
+    newest_first(&mut branches);
+
+    if output == Output::Json {
+        let branches: Vec<_> = branches
+            .iter()
+            .map(|bucket| {
+                json!({
+                    "branch": bucket.id,
+                    "bucket": format!("{ENVIRONMENT}/{}", bucket.id),
+                    "entry_count": bucket.entry_count,
+                    "release_count": bucket.release_count,
+                    "latest": latest(bucket).map(|tag| json!({
+                        "release_num": tag.release.release_num,
+                        "update_time": tag.update_time,
+                    })),
+                })
+            })
+            .collect();
+        return print_json(&json!({ "branches": branches }));
+    }
+    if branches.is_empty() {
+        eprintln!(
+            "{} has no branches: `toaba assets branch sync` makes one",
+            target.app_name
+        );
+        return Ok(());
+    }
+    let rows: Vec<[String; 4]> = branches
+        .iter()
+        .map(|bucket| {
+            let latest = latest(bucket);
+            [
+                bucket.id.clone(),
+                latest
+                    .map(|tag| format!("#{}", tag.release.release_num))
+                    .unwrap_or_default(),
+                bucket.entry_count.to_string(),
+                latest.map(|tag| date(&tag.update_time)).unwrap_or_default(),
+            ]
+        })
+        .collect();
+    table(["BRANCH", "RELEASE", "FILES", "RELEASED"], &rows);
+    Ok(())
+}
+
+/// The bucket's `latest` tag, which moves with each release: none before the first.
+fn latest(bucket: &api::Bucket) -> Option<&api::Tag> {
+    bucket.tags.iter().find(|tag| tag.id == LATEST)
+}
+
+/// Sorts branches by their latest release, newest first, so the stale ones end the list; those
+/// never released come last, by name.
+fn newest_first(branches: &mut [api::Bucket]) {
+    branches.sort_by_key(|bucket| std::cmp::Reverse(latest(bucket).map(|tag| tag.update_time)));
+}
+
 pub(super) async fn close(args: CloseArgs, output: Output) -> anyhow::Result<()> {
     let CloseArgs {
         branch: name,
@@ -334,6 +401,30 @@ mod tests {
         for bad in ["feature/ui", "PR-1", "pr--1", "123", ""] {
             assert!(branch(bad).is_err(), "{bad}");
         }
+    }
+
+    #[test]
+    fn branches_released_last_end_the_list_and_unreleased_ones_come_after() {
+        let bucket = |id: &str, released: Option<&str>| -> api::Bucket {
+            let tags = match released {
+                Some(time) => json!([{ "id": "latest", "release": { "id": "r", "release_num": 1 },
+                    "previous_release": null, "revision": 1, "update_time": time }]),
+                None => json!([]),
+            };
+            serde_json::from_value(json!({ "id": id, "name": id, "write_access": "open",
+                "revision": 1, "entry_count": 0, "release_count": 1, "unreleased_count": 0,
+                "tags": tags }))
+            .unwrap()
+        };
+        let mut branches = [
+            bucket("pr-1", Some("2026-11-01T10:00:00Z")),
+            bucket("pr-2", None),
+            bucket("pr-3", Some("2026-11-09T10:00:00Z")),
+            bucket("pr-4", None),
+        ];
+        newest_first(&mut branches);
+        let ids: Vec<&str> = branches.iter().map(|bucket| bucket.id.as_str()).collect();
+        assert_eq!(ids, ["pr-3", "pr-1", "pr-2", "pr-4"]);
     }
 
     #[tokio::test]
