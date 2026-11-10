@@ -3,7 +3,7 @@
 
 use std::path::PathBuf;
 
-use anyhow::bail;
+use anyhow::{Context as _, bail};
 use clap::Subcommand;
 use console::style;
 use indicatif::{HumanBytes, ProgressBar};
@@ -24,6 +24,11 @@ pub enum Command {
     Release {
         #[command(subcommand)]
         command: ReleaseCommand,
+    },
+    /// A bucket's tags: the names game clients download releases by
+    Tag {
+        #[command(subcommand)]
+        command: TagCommand,
     },
     /// Make a bucket's files match a local folder
     ///
@@ -100,8 +105,61 @@ pub enum ReleaseCommand {
     },
 }
 
+#[derive(Subcommand)]
+pub enum TagCommand {
+    /// List a bucket's tags and the releases they point at
+    #[command(visible_alias = "ls")]
+    List {
+        /// The bucket, as env/bucket
+        bucket: BucketRef,
+        #[command(flatten)]
+        app: AppArg,
+    },
+    /// Point a tag at a release, creating the tag or moving it
+    ///
+    /// Game clients that download by the tag get that release. Moving a tag back
+    /// to an older release is how to roll back. `latest` can't be set: it follows
+    /// new releases by itself.
+    Set {
+        /// The tag, such as stable
+        #[arg(value_parser = tag_name)]
+        tag: String,
+        /// The bucket, as env/bucket
+        bucket: BucketRef,
+        /// The release: its number, or another tag to point at the same release, such as latest
+        release: String,
+        #[command(flatten)]
+        app: AppArg,
+        /// Go ahead without asking; needed where there's nobody to ask, as in CI
+        #[arg(short, long)]
+        yes: bool,
+    },
+}
+
+/// A tag's name: lowercase letters, digits and single hyphens, starting with a letter.
+fn tag_name(text: &str) -> Result<String, String> {
+    if target::is_slug(text) {
+        Ok(text.to_string())
+    } else {
+        Err("a tag is lowercase letters, digits and hyphens, starting with a letter".to_string())
+    }
+}
+
 pub async fn run(command: Command, output: Output) -> anyhow::Result<()> {
     match command {
+        Command::Tag {
+            command: TagCommand::List { bucket, app },
+        } => list_tags(bucket, app, output).await,
+        Command::Tag {
+            command:
+                TagCommand::Set {
+                    tag,
+                    bucket,
+                    release,
+                    app,
+                    yes,
+                },
+        } => set_tag(tag, bucket, release, app, yes, output).await,
         Command::Release {
             command: ReleaseCommand::List { bucket, app, limit },
         } => list_releases(bucket, app, limit, output).await,
@@ -413,6 +471,163 @@ async fn cut_release(
         ),
     );
     Ok(Some(release))
+}
+
+async fn set_tag(
+    tag: String,
+    bucket: BucketRef,
+    release: String,
+    arg: AppArg,
+    yes: bool,
+    output: Output,
+) -> anyhow::Result<()> {
+    if tag == "latest" {
+        bail!("latest follows new releases by itself and can't be set");
+    }
+    // Found before the spinner starts, since finding it may ask which app.
+    let target = target::app(arg).await?;
+    let path = api::bucket_path(&target.app_id, &bucket.environment_id, &bucket.bucket_id);
+    let line = progress::start("Reading the bucket…");
+    let read = async {
+        bucket.check(&target).await?;
+        let tags = target.client.tags(&path).await?;
+        let release_num = match release.trim_start_matches('#').parse::<u64>() {
+            Ok(num) => num,
+            Err(_) => tags
+                .iter()
+                .find(|other| other.id == release)
+                .map(|other| other.release.release_num)
+                .with_context(|| {
+                    format!("{release} is neither a release number nor a tag of {bucket}")
+                })?,
+        };
+        let to = target
+            .client
+            .release_by_num(&path, release_num)
+            .await
+            .map_err(|err| {
+                // Only the not-found answer is reworded to name the bucket.
+                if err.to_string().starts_with("the bucket has no release") {
+                    anyhow::anyhow!("{bucket} has no release #{release_num}")
+                } else {
+                    err
+                }
+            })?;
+        anyhow::Ok((tags.into_iter().find(|current| current.id == tag), to))
+    }
+    .await;
+    let (current, to) = read.inspect_err(|_| progress::failed(&line, "Reading the bucket"))?;
+    line.finish_and_clear();
+
+    let bold = |text: &str| style(text.to_string()).bold().for_stderr();
+    let to_label = format!("#{} {}", to.release_num, to.name);
+    if let Some(current) = &current {
+        if current.release.id == to.id {
+            eprintln!("{} already points at {to_label} in {bucket}", bold(&tag));
+            if output == Output::Json {
+                print_json(current)?;
+            }
+            return Ok(());
+        }
+        eprintln!(
+            "{} in {bucket}: #{} → {to_label}",
+            bold(&tag),
+            current.release.release_num
+        );
+        eprintln!(
+            "{}",
+            style(format!(
+                "Game clients downloading by {tag} get release #{} from then on",
+                to.release_num
+            ))
+            .dim()
+            .for_stderr()
+        );
+        prompt::confirm_or_yes(&format!("Move {tag}?"), yes)?;
+    }
+
+    let line = progress::start("Setting the tag…");
+    let set = target
+        .client
+        .set_tag(
+            &path,
+            &tag,
+            &to.id,
+            current.as_ref().map(|current| current.revision),
+        )
+        .await
+        .inspect_err(|_| progress::failed(&line, "Setting the tag"))?;
+    progress::finish(
+        &line,
+        format!(
+            "{} {} {} {to_label} in {bucket}",
+            theme::accent().apply_to("✓"),
+            bold(&tag),
+            if current.is_some() {
+                "now points at"
+            } else {
+                "created, pointing at"
+            },
+        ),
+    );
+    if output == Output::Json {
+        print_json(&set)?;
+    }
+    Ok(())
+}
+
+async fn list_tags(bucket: BucketRef, arg: AppArg, output: Output) -> anyhow::Result<()> {
+    // Found before the spinner starts, since finding it may ask which app.
+    let target = target::app(arg).await?;
+    let line = progress::start("Loading the tags…");
+    let loaded = async {
+        bucket.check(&target).await?;
+        let path = api::bucket_path(&target.app_id, &bucket.environment_id, &bucket.bucket_id);
+        target.client.tags(&path).await
+    }
+    .await;
+    let tags = loaded.inspect_err(|_| progress::failed(&line, "Loading the tags"))?;
+    line.finish_and_clear();
+
+    if output == Output::Json {
+        return print_json(&json!({ "tags": tags }));
+    }
+    if tags.is_empty() {
+        eprintln!("{bucket} has no tags yet: latest appears with its first release");
+        return Ok(());
+    }
+
+    let rows: Vec<[String; 4]> = tags
+        .iter()
+        .map(|tag| {
+            [
+                tag.id.clone(),
+                format!("#{}", tag.release.release_num),
+                tag.previous_release
+                    .as_ref()
+                    .map(|release| format!("#{}", release.release_num))
+                    .unwrap_or_default(),
+                tag.update_time.format("%-d %b %Y").to_string(),
+            ]
+        })
+        .collect();
+    let headers = ["TAG", "RELEASE", "BEFORE", "MOVED"];
+    let widths: Vec<usize> = (0..headers.len())
+        .map(|column| width(headers[column], rows.iter().map(|row| &row[column])))
+        .collect();
+    let print = |cells: [&str; 4]| {
+        let padded: Vec<String> = cells
+            .iter()
+            .zip(&widths)
+            .map(|(cell, width)| pad(cell, *width))
+            .collect();
+        println!("{}", padded.join("  ").trim_end());
+    };
+    print(headers);
+    for row in &rows {
+        print([&row[0], &row[1], &row[2], &row[3]]);
+    }
+    Ok(())
 }
 
 async fn list_releases(

@@ -269,7 +269,7 @@ impl BucketRef {
 
 /// An id people choose: a lowercase letter, then lowercase letters and digits in parts joined by
 /// single hyphens, 63 characters at most.
-fn is_slug(text: &str) -> bool {
+pub fn is_slug(text: &str) -> bool {
     text.len() <= 63
         && text.starts_with(|first: char| first.is_ascii_lowercase())
         && text.split('-').all(|part| {

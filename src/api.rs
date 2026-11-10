@@ -75,7 +75,6 @@ impl Client {
         self.call(Method::POST, path, Some(body)).await
     }
 
-    #[allow(dead_code, reason = "the foundation for the commands to come")]
     pub async fn put<T: DeserializeOwned>(
         &self,
         path: &str,
@@ -163,19 +162,70 @@ impl Client {
 
     /// The bucket's newest releases, `limit` at most (up to 1,000), and whether there are more.
     pub async fn releases(&self, bucket: &str, limit: u16) -> anyhow::Result<(Vec<Release>, bool)> {
+        let page = self.release_page(bucket, limit, None).await?;
+        Ok((page.data, page.next_page_token.is_some()))
+    }
+
+    /// The bucket's release with this number, which is how people name one.
+    pub async fn release_by_num(&self, bucket: &str, release_num: u64) -> anyhow::Result<Release> {
+        let mut page_token = None;
+        loop {
+            let page = self
+                .release_page(bucket, 1000, page_token.as_deref())
+                .await?;
+            // Newest first: once past the number, it isn't there.
+            let passed = page
+                .data
+                .last()
+                .is_none_or(|last| last.release_num < release_num);
+            if let Some(found) = page.data.into_iter().find(|r| r.release_num == release_num) {
+                return Ok(found);
+            }
+            match page.next_page_token {
+                Some(token) if !passed => page_token = Some(token),
+                _ => anyhow::bail!("the bucket has no release #{release_num}"),
+            }
+        }
+    }
+
+    async fn release_page(
+        &self,
+        bucket: &str,
+        page_size: u16,
+        page_token: Option<&str>,
+    ) -> anyhow::Result<ReleasePage> {
         let path = format!("{bucket}/releases");
-        let page: ReleasePage = self
-            .send(
-                Method::GET,
-                &path,
-                &[("page_size", &limit.to_string())],
-                None::<&()>,
-            )
+        let page_size = page_size.to_string();
+        let mut query = vec![("page_size", page_size.as_str())];
+        if let Some(token) = page_token {
+            query.push(("page_token", token));
+        }
+        self.send(Method::GET, &path, &query, None::<&()>)
             .await?
             .json()
             .await
-            .with_context(|| format!("the API's answer to {path} wasn't what the CLI expects"))?;
-        Ok((page.data, page.next_page_token.is_some()))
+            .with_context(|| format!("the API's answer to {path} wasn't what the CLI expects"))
+    }
+
+    /// Points a tag at a release: creates it when `revision` is none, or moves it from the state
+    /// read at `revision`, so a move made meanwhile isn't overwritten.
+    pub async fn set_tag(
+        &self,
+        bucket: &str,
+        tag_id: &str,
+        release_id: &str,
+        revision: Option<u64>,
+    ) -> anyhow::Result<Tag> {
+        self.put(
+            &format!("{bucket}/tags/{tag_id}"),
+            &serde_json::json!({ "release_id": release_id, "expected_revision": revision }),
+        )
+        .await
+    }
+
+    /// The bucket's tags, by name. `latest` is among them once there's a release.
+    pub async fn tags(&self, bucket: &str) -> anyhow::Result<Vec<Tag>> {
+        self.get(&format!("{bucket}/tags")).await
     }
 
     /// How the bucket's files differ from its latest release: everything is added before the first.
@@ -447,6 +497,7 @@ impl fmt::Display for Error {
             Some("promotion_only") => f.write_str(
                 "the bucket only takes promoted releases, so its files can't be changed directly",
             ),
+            Some("stale_tag") => f.write_str("the tag was moved meanwhile, run the command again"),
             Some("stale_entries") => {
                 f.write_str("the bucket's files changed meanwhile, run the command again")
             }
@@ -571,6 +622,12 @@ pub struct Bucket {
 pub struct Tag {
     pub id: String,
     pub release: ReleaseRef,
+    /// The release it pointed at before its last move, if it has moved.
+    pub previous_release: Option<ReleaseRef>,
+    /// Echoed when moving the tag, so a move made meanwhile isn't overwritten.
+    pub revision: u64,
+    /// When it was created or last moved.
+    pub update_time: DateTime<Utc>,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -861,6 +918,40 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.downcast_ref::<Error>().unwrap().is("promotion_only"));
+    }
+
+    #[tokio::test]
+    async fn a_release_is_found_by_its_number_or_reported_missing() {
+        let server = MockServer::start().await;
+        let release = |num: u64| {
+            json!({ "id": format!("r{num}"), "release_num": num, "name": "v", "notes": null,
+                "entry_count": 0, "size_bytes": 0, "promoted_from": null,
+                "create_time": "2026-11-10T10:00:00Z", "tags": [] })
+        };
+        let releases = "/storage/v1/apps/app_a/environments/staging/buckets/assets/releases";
+        Mock::given(method("GET"))
+            .and(path(releases))
+            .and(query_param_is_missing("page_token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": [release(5), release(4)], "next_page_token": "more",
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(releases))
+            .and(query_param("page_token", "more"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": [release(3), release(1)], "next_page_token": null,
+            })))
+            .mount(&server)
+            .await;
+
+        let bucket = bucket_path("app_a", "staging", "assets");
+        let client = client(&server).await;
+        assert_eq!(client.release_by_num(&bucket, 3).await.unwrap().id, "r3");
+        let missing = client.release_by_num(&bucket, 2).await.unwrap_err();
+        assert_eq!(message(missing), "the bucket has no release #2");
+        assert!(client.release_by_num(&bucket, 9).await.is_err());
     }
 
     #[tokio::test]
