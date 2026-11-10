@@ -53,6 +53,26 @@ pub fn width<S: AsRef<str>>(header: &str, values: impl IntoIterator<Item = S>) -
         .unwrap_or(0)
 }
 
+/// `text` with each control character, such as an escape or a line break, replaced by \u{fffd}.
+pub fn plain(text: &str) -> String {
+    text.chars()
+        .map(|c| if c.is_control() { '\u{fffd}' } else { c })
+        .collect()
+}
+
+/// `text` cut to `max` terminal cells, ending in … when it was longer.
+pub fn short(text: &str, max: usize) -> String {
+    console::truncate_str(text, max, "…").into_owned()
+}
+
+/// The first three of `items`, then how many more there are.
+pub fn few(items: &[String], separator: &str) -> String {
+    match items.len() {
+        0..=3 => items.join(separator),
+        n => format!("{}{separator}+{} more", items[..3].join(separator), n - 3),
+    }
+}
+
 /// `text` with spaces after it up to `width` terminal cells.
 pub fn pad(text: &str, width: usize) -> String {
     let missing = width.saturating_sub(console::measure_text_width(text));
@@ -62,6 +82,17 @@ pub fn pad(text: &str, width: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn long_names_and_long_lists_are_cut_short() {
+        assert_eq!(short("v1.4", 10), "v1.4");
+        // A two-cell character that would straddle the limit is left out.
+        let cut = short(&"夏".repeat(40), 10);
+        assert!(cut.ends_with('…') && console::measure_text_width(&cut) <= 10);
+        let tags: Vec<String> = (1..=5).map(|n| format!("t{n}")).collect();
+        assert_eq!(few(&tags, ", "), "t1, t2, t3, +2 more");
+        assert_eq!(few(&tags[..3], ", "), "t1, t2, t3");
+    }
 
     #[test]
     fn columns_line_up_by_displayed_width() {

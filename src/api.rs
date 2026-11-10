@@ -545,6 +545,19 @@ impl fmt::Display for Error {
 
 impl std::error::Error for Error {}
 
+/// Reads a name someone chose, with any control characters replaced. Left in, a name holding
+/// terminal escape codes or line breaks could redraw the screen or pass for the CLI's own output.
+fn plain<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<String, D::Error> {
+    Ok(crate::output::plain(&String::deserialize(deserializer)?))
+}
+
+fn plain_opt<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<String>, D::Error> {
+    let text = Option::<String>::deserialize(deserializer)?;
+    Ok(text.map(|text| crate::output::plain(&text)))
+}
+
 /// The fields of an access token that the CLI shows.
 #[derive(Deserialize)]
 pub struct CurrentToken {
@@ -554,8 +567,10 @@ pub struct CurrentToken {
 
 #[derive(Deserialize)]
 pub struct Owner {
+    #[serde(deserialize_with = "plain_opt", default)]
     pub name: Option<String>,
     /// A person's; service accounts have none.
+    #[serde(deserialize_with = "plain_opt", default)]
     pub email: Option<String>,
 }
 
@@ -572,6 +587,7 @@ impl Owner {
 #[derive(Deserialize)]
 pub struct Org {
     pub id: String,
+    #[serde(deserialize_with = "plain")]
     pub name: String,
 }
 
@@ -579,6 +595,7 @@ pub struct Org {
 #[derive(Debug, Deserialize)]
 pub struct App {
     pub id: String,
+    #[serde(deserialize_with = "plain")]
     pub name: String,
     pub org_id: String,
     /// When it was scheduled for deletion.
@@ -600,6 +617,7 @@ pub struct PublishableKey {
 #[derive(Debug, Deserialize)]
 pub struct Environment {
     pub id: String,
+    #[serde(deserialize_with = "plain")]
     pub name: String,
 }
 
@@ -607,6 +625,7 @@ pub struct Environment {
 #[derive(Debug, Deserialize)]
 pub struct Bucket {
     pub id: String,
+    #[serde(deserialize_with = "plain")]
     pub name: String,
     /// `open`, or `promotion_only` for a bucket whose files and releases arrive only by promotion.
     pub write_access: String,
@@ -642,6 +661,7 @@ pub struct ReleaseRef {
 pub struct Entry {
     pub id: String,
     /// Its path in the bucket, with `/` between folders.
+    #[serde(deserialize_with = "plain")]
     pub path: String,
     /// Echoed when changing or removing the file, so a change made meanwhile isn't overwritten.
     pub revision: u64,
@@ -714,7 +734,9 @@ pub struct Release {
     pub id: String,
     /// Counts up from 1 in each bucket; people know a release by it.
     pub release_num: u64,
+    #[serde(deserialize_with = "plain")]
     pub name: String,
+    #[serde(deserialize_with = "plain_opt", default)]
     pub notes: Option<String>,
     pub entry_count: u64,
     pub size_bytes: u64,
@@ -952,6 +974,18 @@ mod tests {
         let missing = client.release_by_num(&bucket, 2).await.unwrap_err();
         assert_eq!(message(missing), "the bucket has no release #2");
         assert!(client.release_by_num(&bucket, 9).await.is_err());
+    }
+
+    #[test]
+    fn names_lose_their_control_characters_as_they_are_read() {
+        let org: Org = serde_json::from_value(json!({
+            "id": "org_a", "name": "red \u{1b}[31mALERT\u{1b}[0m\nsecond line"
+        }))
+        .unwrap();
+        assert_eq!(
+            org.name,
+            "red \u{fffd}[31mALERT\u{fffd}[0m\u{fffd}second line"
+        );
     }
 
     #[tokio::test]

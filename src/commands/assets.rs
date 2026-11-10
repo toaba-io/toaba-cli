@@ -9,7 +9,7 @@ use console::style;
 use indicatif::{HumanBytes, ProgressBar};
 use serde_json::json;
 
-use crate::output::{Output, pad, print_json, width};
+use crate::output::{Output, few, pad, plain, print_json, short, width};
 use crate::target::{self, AppArg, BucketRef};
 use crate::{api, progress, prompt, sync, theme};
 
@@ -351,7 +351,7 @@ fn plan_text(plan: &sync::Plan, stdout: bool) -> String {
         for change in changes.iter() {
             text.push_str(&format!(
                 "  {mark} {}  {:>size_width$}  {}\n",
-                pad(&change.path, path_width),
+                pad(&plain(&change.path), path_width),
                 HumanBytes(change.size_bytes).to_string(),
                 dim(what)
             ));
@@ -459,7 +459,7 @@ async fn cut_release(
         format!(
             "{} Released {} as #{} of {bucket} {}",
             theme::accent().apply_to("✓"),
-            style(&release.name).bold().for_stderr(),
+            style(short(&release.name, 60)).bold().for_stderr(),
             release.release_num,
             style(format!(
                 "· {} files, {}",
@@ -520,7 +520,7 @@ async fn set_tag(
     line.finish_and_clear();
 
     let bold = |text: &str| style(text.to_string()).bold().for_stderr();
-    let to_label = format!("#{} {}", to.release_num, to.name);
+    let to_label = format!("#{} {}", to.release_num, short(&to.name, 60));
     if let Some(current) = &current {
         if current.release.id == to.id {
             eprintln!("{} already points at {to_label} in {bucket}", bold(&tag));
@@ -669,11 +669,11 @@ async fn list_releases(
             }
             [
                 format!("#{}", release.release_num),
-                release.name.clone(),
+                short(&release.name, 40),
                 release.entry_count.to_string(),
                 HumanBytes(release.size_bytes).to_string(),
                 release.create_time.format("%-d %b %Y").to_string(),
-                tags.join(" "),
+                few(&tags, " "),
             ]
         })
         .collect();
@@ -767,7 +767,7 @@ async fn list_buckets(arg: AppArg, output: Output) -> anyhow::Result<()> {
                 bucket.id.clone(),
                 write,
                 bucket.unreleased_count.to_string(),
-                tags.join(", "),
+                few(&tags, ", "),
             ]
         })
         .collect();
