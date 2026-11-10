@@ -4,7 +4,7 @@ use console::style;
 
 use super::release::{find_release, release_label, release_size};
 use super::tag::{LATEST, tag_name};
-use crate::output::{Output, print_json};
+use crate::output::{Output, print_json, short};
 use crate::prompt::YesArg;
 use crate::target::{self, AppArg, BucketRef};
 use crate::{api, progress, theme};
@@ -22,6 +22,12 @@ pub struct Args {
     /// Point this tag of the target bucket at the new release; repeatable
     #[arg(long, value_parser = tag_name)]
     tag: Vec<String>,
+    /// A name for the new release, such as v1.4 [default: the promoted release's]
+    #[arg(long)]
+    name: Option<String>,
+    /// Notes to keep with the new release [default: the promoted release's]
+    #[arg(long)]
+    notes: Option<String>,
     #[command(flatten)]
     yes: YesArg,
 }
@@ -33,6 +39,8 @@ pub(super) async fn run(args: Args, output: Output) -> anyhow::Result<()> {
         target: to,
         app: arg,
         tag: tags,
+        name,
+        notes,
         yes,
     } = args;
     yes.require("promoting changes the target bucket and its latest tag: pass --yes to go ahead")?;
@@ -75,9 +83,13 @@ pub(super) async fn run(args: Args, output: Output) -> anyhow::Result<()> {
     }
 
     eprintln!(
-        "Promote {} from {source} into {}",
+        "Promote {} from {source} into {}{}",
         bold(&from_label),
-        bold(&to.to_string())
+        bold(&to.to_string()),
+        match &name {
+            Some(name) => format!(" as {}", bold(&short(name, 60))),
+            None => String::new(),
+        }
     );
     match &diff {
         Some(diff) => eprintln!(
@@ -105,7 +117,10 @@ pub(super) async fn run(args: Args, output: Output) -> anyhow::Result<()> {
             ),
             None => eprintln!("  {tag} is created, pointing at the new release"),
         }
-        moves.push((tag.clone(), current.map(|current| current.revision)));
+        moves.push(api::PromotedTag {
+            id: tag.clone(),
+            expected_revision: current.map(|current| current.revision),
+        });
     }
     eprintln!(
         "{}",
@@ -120,21 +135,19 @@ pub(super) async fn run(args: Args, output: Output) -> anyhow::Result<()> {
     );
     yes.confirm("Promote?")?;
 
-    let promoted = progress::during(
-        "Promoting…",
-        source.promote(
-            &from.id,
-            &to.name.environment_id,
-            &to.name.bucket_id,
-            &moves,
-        ),
-    )
-    .await?;
+    let promotion = api::Promotion {
+        target_environment_id: &to.name.environment_id,
+        target_bucket_id: &to.name.bucket_id,
+        name: name.as_deref(),
+        notes: notes.as_deref(),
+        tags: moves,
+    };
+    let promoted = progress::during("Promoting…", source.promote(&from.id, &promotion)).await?;
     eprintln!(
-        "{} Promoted {} to {to} as #{} {}",
+        "{} Promoted {} to {to} as {} {}",
         theme::accent().apply_to("✓"),
         bold(&from_label),
-        promoted.release_num,
+        bold(&release_label(&promoted)),
         release_size(&promoted)
     );
     if output == Output::Json {

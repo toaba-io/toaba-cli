@@ -186,10 +186,14 @@ pub(super) async fn sync(args: SyncArgs, output: Output) -> anyhow::Result<()> {
         if let Some(start) = &start {
             let promoted;
             (promoted, remote) = progress::during("Starting the branch…", async {
-                let promoted = start
-                    .source
-                    .promote(&start.release.id, ENVIRONMENT, &name.bucket_id, &[])
-                    .await?;
+                let promotion = api::Promotion {
+                    target_environment_id: ENVIRONMENT,
+                    target_bucket_id: &name.bucket_id,
+                    name: None,
+                    notes: None,
+                    tags: Vec::new(),
+                };
+                let promoted = start.source.promote(&start.release.id, &promotion).await?;
                 Ok((promoted, bucket.entries().await?))
             })
             .await?;

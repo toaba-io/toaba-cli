@@ -197,28 +197,17 @@ impl BucketApi<'_> {
             .with_context(|| format!("the API's answer to {path} had no summary"))
     }
 
-    /// Publishes a release of this bucket in the target bucket: its files become the release's, a
-    /// new release is cut there, and `latest` and the given tags move to it, all or nothing. Each
-    /// tag comes with the revision it was read at, none for a tag to create.
+    /// Publishes a release of this bucket in another: its files become the release's, a new
+    /// release is cut there, and `latest` and the promotion's tags move to it, all or nothing.
     pub async fn promote(
         &self,
         release_id: &str,
-        target_environment_id: &str,
-        target_bucket_id: &str,
-        tags: &[(String, Option<u64>)],
+        promotion: &Promotion<'_>,
     ) -> anyhow::Result<Release> {
-        let tags: Vec<_> = tags
-            .iter()
-            .map(|(id, revision)| serde_json::json!({ "id": id, "expected_revision": revision }))
-            .collect();
         self.client
             .post_once(
                 &format!("{}/releases/{release_id}/promote", self.path),
-                &serde_json::json!({
-                    "target_environment_id": target_environment_id,
-                    "target_bucket_id": target_bucket_id,
-                    "tags": tags,
-                }),
+                promotion,
             )
             .await
     }
@@ -450,6 +439,25 @@ pub struct Release {
     pub create_time: DateTime<Utc>,
 }
 
+/// Where to promote a release, as `promote` takes it.
+#[derive(Serialize)]
+pub struct Promotion<'a> {
+    pub target_environment_id: &'a str,
+    pub target_bucket_id: &'a str,
+    /// The new release's name and notes; none keeps the promoted release's.
+    pub name: Option<&'a str>,
+    pub notes: Option<&'a str>,
+    /// Tags of the target to move to the new release.
+    pub tags: Vec<PromotedTag>,
+}
+
+/// A tag to move with a promotion, with the revision it was read at; none for a tag to create.
+#[derive(Serialize)]
+pub struct PromotedTag {
+    pub id: String,
+    pub expected_revision: Option<u64>,
+}
+
 /// A release in another bucket, at the other end of a promotion.
 #[derive(Debug, Deserialize, Serialize)]
 pub struct ReleaseLink {
@@ -609,6 +617,60 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.downcast_ref::<Error>().unwrap().is("promotion_only"));
+    }
+
+    #[tokio::test]
+    async fn a_promotion_names_its_target_release_and_tags() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path(
+                "/storage/v1/apps/app_a/environments/staging/buckets/assets/releases/r9/promote",
+            ))
+            .and(header_exists("idempotency-key"))
+            .and(body_json(json!({
+                "target_environment_id": "production",
+                "target_bucket_id": "assets",
+                "name": "v1.4",
+                "notes": null,
+                "tags": [
+                    { "id": "stable", "expected_revision": 3 },
+                    { "id": "beta", "expected_revision": null },
+                ],
+            })))
+            .respond_with(ResponseTemplate::new(201).set_body_json(json!({ "data": {
+                "id": "r3", "release_num": 3, "name": "v1.4", "notes": null,
+                "entry_count": 3, "size_bytes": 10, "create_time": "2026-11-10T10:00:00Z",
+                "promoted_from": { "release_num": 9, "environment_id": "staging",
+                    "bucket_id": "assets" },
+                "tags": [],
+            }})))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let promotion = super::Promotion {
+            target_environment_id: "production",
+            target_bucket_id: "assets",
+            name: Some("v1.4"),
+            notes: None,
+            tags: vec![
+                super::PromotedTag {
+                    id: "stable".into(),
+                    expected_revision: Some(3),
+                },
+                super::PromotedTag {
+                    id: "beta".into(),
+                    expected_revision: None,
+                },
+            ],
+        };
+        let promoted = client(&server)
+            .await
+            .bucket("app_a", "staging", "assets")
+            .promote("r9", &promotion)
+            .await
+            .unwrap();
+        assert_eq!(promoted.name, "v1.4");
     }
 
     #[tokio::test]
