@@ -4,7 +4,7 @@
 use std::path::PathBuf;
 
 use console::style;
-use indicatif::{HumanBytes, ProgressBar};
+use indicatif::HumanBytes;
 use serde_json::json;
 
 use super::release::{CutRelease, cut_release};
@@ -71,7 +71,7 @@ pub(super) async fn run(args: Args, output: Output) -> anyhow::Result<()> {
     .await?;
 
     let total: u64 = files.iter().map(|(_, _, size)| size).sum();
-    let bar = ProgressBar::new(total).with_style(progress::bytes("Hashing"));
+    let bar = progress::bar(total, "Hashing");
     let local = tokio::task::spawn_blocking({
         let bar = bar.clone();
         move || mirror::hash(files, &bar)
@@ -100,7 +100,7 @@ pub(super) async fn run(args: Args, output: Output) -> anyhow::Result<()> {
             None => format!("Sync {bucket} like this?"),
         };
         yes.confirm(&question)?;
-        let bar = ProgressBar::new(plan.upload_bytes()).with_style(progress::bytes("Uploading"));
+        let bar = progress::bar(plan.upload_bytes(), "Uploading");
         mirror::apply(&bucket, &local, &remote, &plan, concurrency.into(), &bar)
             .await
             .inspect_err(|_| bar.abandon())?;

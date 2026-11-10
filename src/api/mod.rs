@@ -27,6 +27,11 @@ pub const CLIENT_ID: &str = "toaba-cli";
 /// The one Toaba API that customers use.
 pub const PRODUCTION_URL: &str = "https://api.toaba.io";
 
+/// How many times a call waits when the API asks it to slow down, and the longest wait it accepts.
+/// A longer one fails at once, so a command never sits for minutes without saying why.
+const RATE_LIMIT_WAITS: u32 = 3;
+const RATE_LIMIT_WAIT_MAX: u64 = 60;
+
 /// How long a call may take in all, as glab's `auth status` allows.
 const TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -158,6 +163,38 @@ impl Client {
         body: Option<&impl Serialize>,
         idempotency_key: Option<&str>,
     ) -> anyhow::Result<Response> {
+        let mut waits = 0;
+        loop {
+            let sent = self
+                .send_once(method.clone(), path, query, body, idempotency_key)
+                .await;
+            // Rate limited: wait as long as the API says, a few times, rather than fail.
+            let wait = sent
+                .as_ref()
+                .err()
+                .and_then(|err| err.downcast_ref::<Error>())
+                .and_then(Error::wait);
+            match wait {
+                Some(seconds) if waits < RATE_LIMIT_WAITS => {
+                    waits += 1;
+                    crate::progress::note(&format!(
+                        "Toaba asked to slow down, continuing in {seconds} seconds…"
+                    ));
+                    tokio::time::sleep(Duration::from_secs(seconds)).await;
+                }
+                _ => return sent,
+            }
+        }
+    }
+
+    async fn send_once(
+        &self,
+        method: Method,
+        path: &str,
+        query: &[(&str, &str)],
+        body: Option<&impl Serialize>,
+        idempotency_key: Option<&str>,
+    ) -> anyhow::Result<Response> {
         let mut request = self
             .http
             .request(method, format!("{}{path}", self.api_url))
@@ -277,6 +314,14 @@ impl Error {
             retry_after,
             extra,
         }
+    }
+
+    /// How many seconds to wait before trying again, when the API said so and it's short enough
+    /// to sit through.
+    fn wait(&self) -> Option<u64> {
+        let seconds = self.retry_after?;
+        (self.status == StatusCode::TOO_MANY_REQUESTS && seconds <= RATE_LIMIT_WAIT_MAX)
+            .then_some(seconds.max(1))
     }
 
     pub fn is(&self, code: &str) -> bool {
@@ -489,19 +534,42 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_rate_limit_says_how_long_to_wait() {
+    async fn a_long_rate_limit_fails_and_says_how_long_to_wait() {
         let server = MockServer::start().await;
         Mock::given(method("GET"))
             .respond_with(
                 ResponseTemplate::new(429)
-                    .insert_header("retry-after", "30")
+                    .insert_header("retry-after", "300")
                     .set_body_json(json!({ "error": "rate_limited" })),
             )
             .mount(&server)
             .await;
 
         let err = client(&server).await.get::<App>("/x").await.unwrap_err();
-        assert_eq!(message(err), "too many requests, try again in 30 seconds");
+        assert_eq!(message(err), "too many requests, try again in 300 seconds");
+    }
+
+    #[tokio::test]
+    async fn a_short_rate_limit_is_waited_out() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(
+                ResponseTemplate::new(429)
+                    .insert_header("retry-after", "1")
+                    .set_body_json(json!({ "error": "rate_limited" })),
+            )
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": { "id": "app_a", "name": "Space Shooter", "org_id": "org_a" }
+            })))
+            .mount(&server)
+            .await;
+
+        let app: App = client(&server).await.get("/x").await.unwrap();
+        assert_eq!(app.id, "app_a");
     }
 
     #[tokio::test]

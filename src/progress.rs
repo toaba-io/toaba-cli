@@ -1,11 +1,15 @@
 //! One spinner line that follows a command's steps and ends as its result, in the brand's colours.
 //! indicatif hides it when stderr isn't a terminal.
 
+use std::sync::Mutex;
 use std::time::Duration;
 
 use indicatif::{ProgressBar, ProgressStyle};
 
 use crate::theme;
+
+/// The line or bar on screen now, so a note can be printed above it rather than through it.
+static CURRENT: Mutex<Option<ProgressBar>> = Mutex::new(None);
 
 /// Starts the line, spinning beside `message`.
 pub fn start(message: &'static str) -> ProgressBar {
@@ -13,7 +17,25 @@ pub fn start(message: &'static str) -> ProgressBar {
         .with_style(spinner("{spinner} {msg}"))
         .with_message(message);
     line.enable_steady_tick(Duration::from_millis(100));
+    show(line)
+}
+
+/// Starts a bar of `total` bytes after `label`.
+pub fn bar(total: u64, label: &str) -> ProgressBar {
+    show(ProgressBar::new(total).with_style(bytes(label)))
+}
+
+fn show(line: ProgressBar) -> ProgressBar {
+    *CURRENT.lock().expect("no panics") = Some(line.clone());
     line
+}
+
+/// Prints a line for the person while work goes on: above the line or bar on screen, if any.
+pub fn note(message: &str) {
+    match &*CURRENT.lock().expect("no panics") {
+        Some(line) if !line.is_finished() && !line.is_hidden() => line.println(message),
+        _ => eprintln!("{message}"),
+    }
 }
 
 /// Runs `work` behind the line. When it fails, the line ends with ✗ and the step, which is
@@ -56,7 +78,7 @@ pub fn failed(line: &ProgressBar, step: &str) {
 }
 
 /// A Tangerine bar of bytes done, after `label`. 209 is Tangerine among the 256 colours.
-pub fn bytes(label: &str) -> ProgressStyle {
+fn bytes(label: &str) -> ProgressStyle {
     ProgressStyle::with_template(&format!(
         "{label}  {{bar:24.209/dim}}  {{bytes}} / {{total_bytes}}"
     ))
