@@ -21,19 +21,19 @@ pub async fn run(args: Args, output: Output) -> anyhow::Result<()> {
         None => only_or_picked()?,
     };
 
-    let line = progress::start("Logging out…");
-    let revoked = match config::tokens(&org_id)? {
-        Some(tokens) => oauth::revoke(&login.api_url, &tokens.refresh_token).await,
-        None => Ok(()),
-    };
-    config::remove(&org_id).inspect_err(|_| progress::failed(&line, "Logging out"))?;
-    progress::finish(
-        &line,
-        format!(
-            "{} Logged out of {}",
-            theme::accent().apply_to("✓"),
-            style(&login.org_name).bold().for_stderr()
-        ),
+    let revoked = progress::during("Logging out…", async {
+        let revoked = match config::tokens(&org_id)? {
+            Some(tokens) => oauth::revoke(&login.api_url, &tokens.refresh_token).await,
+            None => Ok(()),
+        };
+        config::remove(&org_id)?;
+        Ok(revoked)
+    })
+    .await?;
+    eprintln!(
+        "{} Logged out of {}",
+        theme::accent().apply_to("✓"),
+        style(&login.org_name).bold().for_stderr()
     );
 
     let warn = theme::warning().apply_to("!");

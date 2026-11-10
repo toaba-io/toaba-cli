@@ -73,6 +73,24 @@ pub fn few(items: &[String], separator: &str) -> String {
     }
 }
 
+/// Prints a table on stdout: the headers, then the rows, each column as wide as its widest cell.
+pub fn table<const N: usize>(headers: [&str; N], rows: &[[String; N]]) {
+    let widths: [usize; N] =
+        std::array::from_fn(|column| width(headers[column], rows.iter().map(|row| &row[column])));
+    let line = |cells: [&str; N]| {
+        let padded: Vec<String> = cells
+            .iter()
+            .zip(&widths)
+            .map(|(cell, width)| pad(cell, *width))
+            .collect();
+        println!("{}", padded.join("  ").trim_end());
+    };
+    line(headers);
+    for row in rows {
+        line(std::array::from_fn(|column| row[column].as_str()));
+    }
+}
+
 /// `text` with spaces after it up to `width` terminal cells.
 pub fn pad(text: &str, width: usize) -> String {
     let missing = width.saturating_sub(console::measure_text_width(text));

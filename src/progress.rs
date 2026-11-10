@@ -16,6 +16,21 @@ pub fn start(message: &'static str) -> ProgressBar {
     line
 }
 
+/// Runs `work` behind the line. When it fails, the line ends with ✗ and the step, which is
+/// `message` without its ellipsis; otherwise the line goes, leaving room for the result.
+pub async fn during<T>(
+    message: &'static str,
+    work: impl Future<Output = anyhow::Result<T>>,
+) -> anyhow::Result<T> {
+    let line = start(message);
+    let result = work.await;
+    match &result {
+        Ok(_) => line.finish_and_clear(),
+        Err(_) => failed(&line, message.trim_end_matches('…')),
+    }
+    result
+}
+
 /// `template` with a Tangerine spinner.
 pub fn spinner(template: &str) -> ProgressStyle {
     let ticks: Vec<String> = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏ "

@@ -22,15 +22,7 @@ struct Checked {
 
 pub async fn run(output: Output) -> anyhow::Result<()> {
     let from_env = auth::from_env().is_some();
-    let line = progress::start("Checking your logins…");
-    let checked = match check().await {
-        Ok(checked) => checked,
-        Err(err) => {
-            progress::failed(&line, "Checking your logins");
-            return Err(err);
-        }
-    };
-    line.finish_and_clear();
+    let checked = progress::during("Checking your logins…", check()).await?;
 
     let in_use_id = if from_env { None } else { config::app()? };
     let in_use = match &in_use_id {

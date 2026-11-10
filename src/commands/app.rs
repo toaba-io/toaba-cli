@@ -8,7 +8,7 @@ use console::style;
 use serde_json::json;
 
 use crate::api::App;
-use crate::output::{Output, pad, print_json, sentence, width};
+use crate::output::{Output, pad, print_json, sentence, table, width};
 use crate::target::{self, AppArg};
 use crate::{auth, config, progress, prompt, theme};
 
@@ -45,11 +45,7 @@ pub async fn run(command: Command, output: Output) -> anyhow::Result<()> {
 }
 
 async fn list(output: Output) -> anyhow::Result<()> {
-    let line = progress::start("Loading your apps…");
-    let (apps, ended) = load()
-        .await
-        .inspect_err(|_| progress::failed(&line, "Loading your apps"))?;
-    line.finish_and_clear();
+    let (apps, ended) = progress::during("Loading your apps…", load()).await?;
     let in_use = match auth::from_env() {
         Some(_) => None,
         None => config::app()?,
@@ -173,13 +169,11 @@ async fn keys(arg: AppArg, env: bool, output: Output) -> anyhow::Result<()> {
     }
     // Found before the spinner starts, since finding it may ask which app.
     let target = target::app(arg).await?;
-    let line = progress::start("Loading the keys…");
-    let keys = target
-        .client
-        .publishable_keys(&target.app_id)
-        .await
-        .inspect_err(|_| progress::failed(&line, "Loading the keys"))?;
-    line.finish_and_clear();
+    let keys = progress::during(
+        "Loading the keys…",
+        target.client.publishable_keys(&target.app_id),
+    )
+    .await?;
 
     if env {
         // The newest, which is the one to ship while an older one is being retired.
@@ -203,15 +197,16 @@ async fn keys(arg: AppArg, env: bool, output: Output) -> anyhow::Result<()> {
         );
         return Ok(());
     }
-    let key_width = width("KEY", keys.iter().map(|key| &key.key));
-    println!("{:<key_width$}  CREATED", "KEY");
-    for key in &keys {
-        println!(
-            "{:<key_width$}  {}",
-            key.key,
-            key.create_time.format("%-d %b %Y")
-        );
-    }
+    let rows: Vec<[String; 2]> = keys
+        .iter()
+        .map(|key| {
+            [
+                key.key.clone(),
+                key.create_time.format("%-d %b %Y").to_string(),
+            ]
+        })
+        .collect();
+    table(["KEY", "CREATED"], &rows);
     Ok(())
 }
 

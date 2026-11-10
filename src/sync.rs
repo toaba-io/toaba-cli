@@ -221,8 +221,7 @@ const ATTEMPTS: u32 = 3;
 /// moving `bar` by the bytes sent, then removes the files gone from the folder. Uploads count only
 /// once completed; on a failure or Ctrl+C the unfinished ones are cancelled, so they hold no room.
 pub async fn apply(
-    client: &api::Client,
-    bucket: &str,
+    bucket: &api::BucketApi<'_>,
     local: &[LocalFile],
     remote: &[api::Entry],
     plan: &Plan,
@@ -244,7 +243,7 @@ pub async fn apply(
     let unfinished: Mutex<Vec<String>> = Mutex::new(Vec::new());
     CLEANS_UP_ON_CTRL_C.store(true, Ordering::Relaxed);
     let outcome = tokio::select! {
-        result = upload_all(client, bucket, &uploads, concurrency, bar, &unfinished) => Some(result),
+        result = upload_all(bucket, &uploads, concurrency, bar, &unfinished) => Some(result),
         _ = tokio::signal::ctrl_c() => None,
     };
     CLEANS_UP_ON_CTRL_C.store(false, Ordering::Relaxed);
@@ -260,7 +259,7 @@ pub async fn apply(
                 .collect();
         for chunk in tokens.chunks(1000) {
             // Best effort: uncancelled uploads expire by themselves.
-            let _ = client.cancel_uploads(bucket, chunk).await;
+            let _ = bucket.cancel_uploads(chunk).await;
         }
     }
     match outcome {
@@ -287,14 +286,13 @@ pub async fn apply(
         })
         .collect();
     for chunk in removals.chunks(1000) {
-        client.delete_entries(bucket, chunk).await?;
+        bucket.delete_entries(chunk).await?;
     }
     Ok(())
 }
 
 async fn upload_all(
-    client: &api::Client,
-    bucket: &str,
+    bucket: &api::BucketApi<'_>,
     uploads: &[&LocalFile],
     concurrency: usize,
     bar: &ProgressBar,
@@ -314,7 +312,7 @@ async fn upload_all(
                 content_type: &file.content_type,
             })
             .collect();
-        let prepared = client.prepare_uploads(bucket, &items).await?;
+        let prepared = bucket.prepare_uploads(&items).await?;
         let by_path: BTreeMap<&str, &LocalFile> = batch
             .iter()
             .map(|file| (file.path.as_str(), *file))
@@ -357,8 +355,8 @@ async fn upload_all(
         }
 
         for chunk in to_complete.chunks(1000) {
-            let failed: Vec<String> = client
-                .complete_uploads(bucket, chunk)
+            let failed: Vec<String> = bucket
+                .complete_uploads(chunk)
                 .await?
                 .into_iter()
                 .filter(|completed| completed.status != "committed")

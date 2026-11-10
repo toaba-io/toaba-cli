@@ -129,180 +129,40 @@ impl Client {
         .await
     }
 
-    /// Every file in the bucket, by path, read a thousand at a time.
-    pub async fn entries(
-        &self,
-        app_id: &str,
-        environment_id: &str,
-        bucket_id: &str,
-    ) -> anyhow::Result<Vec<Entry>> {
-        let path = format!("{}/entries", bucket_path(app_id, environment_id, bucket_id));
-        let mut entries = Vec::new();
-        let mut page_token: Option<String> = None;
-        loop {
-            let mut query = vec![("recursive", "true"), ("page_size", "1000")];
-            if let Some(token) = &page_token {
-                query.push(("page_token", token));
-            }
-            let page: EntryPage = self
-                .send(Method::GET, &path, &query, None::<&()>)
-                .await?
-                .json()
-                .await
-                .with_context(|| {
-                    format!("the API's answer to {path} wasn't what the CLI expects")
-                })?;
-            entries.extend(page.data);
-            match page.next_page_token {
-                Some(token) => page_token = Some(token),
-                None => return Ok(entries),
-            }
+    /// A bucket of the app's assets, to call its files, releases and tags through.
+    pub fn bucket(&self, app_id: &str, environment_id: &str, bucket_id: &str) -> BucketApi<'_> {
+        BucketApi {
+            client: self,
+            path: format!(
+                "/storage/v1/apps/{app_id}/environments/{environment_id}/buckets/{bucket_id}"
+            ),
         }
     }
 
-    /// The bucket's newest releases, `limit` at most (up to 1,000), and whether there are more.
-    pub async fn releases(&self, bucket: &str, limit: u16) -> anyhow::Result<(Vec<Release>, bool)> {
-        let page = self.release_page(bucket, limit, None).await?;
-        Ok((page.data, page.next_page_token.is_some()))
-    }
-
-    /// The bucket's release with this number, which is how people name one.
-    pub async fn release_by_num(&self, bucket: &str, release_num: u64) -> anyhow::Result<Release> {
-        let mut page_token = None;
-        loop {
-            let page = self
-                .release_page(bucket, 1000, page_token.as_deref())
-                .await?;
-            // Newest first: once past the number, it isn't there.
-            let passed = page
-                .data
-                .last()
-                .is_none_or(|last| last.release_num < release_num);
-            if let Some(found) = page.data.into_iter().find(|r| r.release_num == release_num) {
-                return Ok(found);
-            }
-            match page.next_page_token {
-                Some(token) if !passed => page_token = Some(token),
-                _ => anyhow::bail!("the bucket has no release #{release_num}"),
-            }
-        }
-    }
-
-    async fn release_page(
-        &self,
-        bucket: &str,
-        page_size: u16,
-        page_token: Option<&str>,
-    ) -> anyhow::Result<ReleasePage> {
-        let path = format!("{bucket}/releases");
-        let page_size = page_size.to_string();
-        let mut query = vec![("page_size", page_size.as_str())];
-        if let Some(token) = page_token {
-            query.push(("page_token", token));
-        }
-        self.send(Method::GET, &path, &query, None::<&()>)
-            .await?
-            .json()
+    /// The app's publishable keys, oldest first.
+    pub async fn publishable_keys(&self, app_id: &str) -> anyhow::Result<Vec<PublishableKey>> {
+        self.get(&format!("/iam/v1/apps/{app_id}/publishable_keys"))
             .await
-            .with_context(|| format!("the API's answer to {path} wasn't what the CLI expects"))
     }
 
-    /// Points a tag at a release: creates it when `revision` is none, or moves it from the state
-    /// read at `revision`, so a move made meanwhile isn't overwritten.
-    pub async fn set_tag(
+    async fn call<T: DeserializeOwned>(
         &self,
-        bucket: &str,
-        tag_id: &str,
-        release_id: &str,
-        revision: Option<u64>,
-    ) -> anyhow::Result<Tag> {
-        self.put(
-            &format!("{bucket}/tags/{tag_id}"),
-            &serde_json::json!({ "release_id": release_id, "expected_revision": revision }),
-        )
-        .await
+        method: Method,
+        path: &str,
+        body: Option<&impl Serialize>,
+    ) -> anyhow::Result<T> {
+        let response = self.send(method, path, &[], body).await?;
+        Ok(decode::<Data<T>>(response, path).await?.data)
     }
 
-    /// The bucket's tags, by name. `latest` is among them once there's a release.
-    pub async fn tags(&self, bucket: &str) -> anyhow::Result<Vec<Tag>> {
-        self.get(&format!("{bucket}/tags")).await
-    }
-
-    /// How the bucket's files differ from its latest release: everything is added before the first.
-    pub async fn unreleased(&self, bucket: &str) -> anyhow::Result<DiffSummary> {
-        let path = format!("{bucket}/compare");
-        let page: DiffPage = self
-            .send(Method::GET, &path, &[("page_size", "1")], None::<&()>)
-            .await?
-            .json()
-            .await
-            .with_context(|| format!("the API's answer to {path} wasn't what the CLI expects"))?;
-        page.summary
-            .with_context(|| format!("the API's answer to {path} had no summary"))
-    }
-
-    /// Cuts a release of the bucket's files as they are now; `latest` moves to it.
-    pub async fn create_release(
+    /// `GET path` for an answer that isn't only `data`, such as a page with its next token.
+    async fn get_whole<T: DeserializeOwned>(
         &self,
-        bucket: &str,
-        name: &str,
-        notes: Option<&str>,
-    ) -> anyhow::Result<Release> {
-        self.post_once(
-            &format!("{bucket}/releases"),
-            &serde_json::json!({ "name": name, "notes": notes }),
-        )
-        .await
-    }
-
-    /// How release `release_id` of `bucket` differs from release `base_id`, which may be in
-    /// another bucket of the app.
-    pub async fn compare_releases(
-        &self,
-        bucket: &str,
-        release_id: &str,
-        base_id: &str,
-    ) -> anyhow::Result<DiffSummary> {
-        let path = format!("{bucket}/releases/{release_id}/compare");
-        let page: DiffPage = self
-            .send(
-                Method::GET,
-                &path,
-                &[("base_release_id", base_id), ("page_size", "1")],
-                None::<&()>,
-            )
-            .await?
-            .json()
-            .await
-            .with_context(|| format!("the API's answer to {path} wasn't what the CLI expects"))?;
-        page.summary
-            .with_context(|| format!("the API's answer to {path} had no summary"))
-    }
-
-    /// Publishes a release of `bucket` in the target bucket: its files become the release's, a
-    /// new release is cut there, and `latest` and the given tags move to it, all or nothing. Each
-    /// tag comes with the revision it was read at, none for a tag to create.
-    pub async fn promote(
-        &self,
-        bucket: &str,
-        release_id: &str,
-        target_environment_id: &str,
-        target_bucket_id: &str,
-        tags: &[(String, Option<u64>)],
-    ) -> anyhow::Result<Release> {
-        let tags: Vec<_> = tags
-            .iter()
-            .map(|(id, revision)| serde_json::json!({ "id": id, "expected_revision": revision }))
-            .collect();
-        self.post_once(
-            &format!("{bucket}/releases/{release_id}/promote"),
-            &serde_json::json!({
-                "target_environment_id": target_environment_id,
-                "target_bucket_id": target_bucket_id,
-                "tags": tags,
-            }),
-        )
-        .await
+        path: &str,
+        query: &[(&str, &str)],
+    ) -> anyhow::Result<T> {
+        let response = self.send(Method::GET, path, query, None::<&()>).await?;
+        decode(response, path).await
     }
 
     /// `POST path` for something that must happen once, such as cutting a release. Sent again, up
@@ -319,12 +179,7 @@ impl Client {
                 .send_keyed(Method::POST, path, &[], Some(body), Some(&key))
                 .await;
             match sent {
-                Ok(response) => {
-                    let answer: Data<T> = response.json().await.with_context(|| {
-                        format!("the API's answer to {path} wasn't what the CLI expects")
-                    })?;
-                    return Ok(answer.data);
-                }
+                Ok(response) => return Ok(decode::<Data<T>>(response, path).await?.data),
                 // The API answered, with a refusal: sending again wouldn't change it.
                 Err(err) if err.is::<Error>() || err.is::<Refused>() || attempt == 3 => {
                     return Err(err);
@@ -332,77 +187,6 @@ impl Client {
                 Err(_) => attempt += 1,
             }
         }
-    }
-
-    /// Asks where to upload files. A file the bucket already has, with the same content and type,
-    /// comes back with no upload. The others get a signed URL to PUT to, which must start within
-    /// five minutes, and their bytes are reserved against the org's storage until completed or
-    /// cancelled.
-    pub async fn prepare_uploads(
-        &self,
-        bucket: &str,
-        items: &[PrepareItem<'_>],
-    ) -> anyhow::Result<Vec<Prepared>> {
-        self.post(
-            &format!("{bucket}/uploads/prepare"),
-            &serde_json::json!({ "items": items }),
-        )
-        .await
-    }
-
-    /// Records uploaded files as their paths' new content. Each answers its own status.
-    pub async fn complete_uploads(
-        &self,
-        bucket: &str,
-        items: &[UploadToken],
-    ) -> anyhow::Result<Vec<Completed>> {
-        self.post(
-            &format!("{bucket}/uploads/complete"),
-            &serde_json::json!({ "items": items }),
-        )
-        .await
-    }
-
-    /// Gives up prepared uploads that weren't completed, freeing the room they reserved.
-    pub async fn cancel_uploads(&self, bucket: &str, items: &[UploadToken]) -> anyhow::Result<()> {
-        self.post_empty(
-            &format!("{bucket}/uploads/cancel"),
-            &serde_json::json!({ "items": items }),
-        )
-        .await
-    }
-
-    /// Removes files from the bucket, all or none: each must still be at the revision given.
-    pub async fn delete_entries(
-        &self,
-        bucket: &str,
-        items: &[EntryRevision],
-    ) -> anyhow::Result<()> {
-        self.post_empty(
-            &format!("{bucket}/entries/batch_delete"),
-            &serde_json::json!({ "items": items }),
-        )
-        .await
-    }
-
-    /// The app's publishable keys, oldest first.
-    pub async fn publishable_keys(&self, app_id: &str) -> anyhow::Result<Vec<PublishableKey>> {
-        self.get(&format!("/iam/v1/apps/{app_id}/publishable_keys"))
-            .await
-    }
-
-    async fn call<T: DeserializeOwned>(
-        &self,
-        method: Method,
-        path: &str,
-        body: Option<&impl Serialize>,
-    ) -> anyhow::Result<T> {
-        let response = self.send(method, path, &[], body).await?;
-        let answer: Data<T> = response
-            .json()
-            .await
-            .with_context(|| format!("the API's answer to {path} wasn't what the CLI expects"))?;
-        Ok(answer.data)
     }
 
     async fn send(
@@ -458,6 +242,211 @@ impl Client {
     }
 }
 
+/// Reads an answer's JSON as `T`.
+async fn decode<T: DeserializeOwned>(response: Response, path: &str) -> anyhow::Result<T> {
+    response
+        .json()
+        .await
+        .with_context(|| format!("the API's answer to {path} wasn't what the CLI expects"))
+}
+
+/// One bucket of an app's assets: its files, uploads, releases and tags.
+pub struct BucketApi<'a> {
+    client: &'a Client,
+    path: String,
+}
+
+impl BucketApi<'_> {
+    /// Every file in the bucket, by path, read a thousand at a time.
+    pub async fn entries(&self) -> anyhow::Result<Vec<Entry>> {
+        let path = format!("{}/entries", self.path);
+        let mut entries = Vec::new();
+        let mut page_token: Option<String> = None;
+        loop {
+            let mut query = vec![("recursive", "true"), ("page_size", "1000")];
+            if let Some(token) = &page_token {
+                query.push(("page_token", token));
+            }
+            let page: Page<Entry> = self.client.get_whole(&path, &query).await?;
+            entries.extend(page.data);
+            match page.next_page_token {
+                Some(token) => page_token = Some(token),
+                None => return Ok(entries),
+            }
+        }
+    }
+
+    /// The newest releases, `limit` at most (up to 1,000), and whether there are more.
+    pub async fn releases(&self, limit: u16) -> anyhow::Result<(Vec<Release>, bool)> {
+        let page = self.release_page(limit, None).await?;
+        Ok((page.data, page.next_page_token.is_some()))
+    }
+
+    /// The release with this number, which is how people name one, if the bucket has it.
+    pub async fn release_by_num(&self, release_num: u64) -> anyhow::Result<Option<Release>> {
+        let mut page_token = None;
+        loop {
+            let page = self.release_page(1000, page_token.as_deref()).await?;
+            // Newest first: once past the number, it isn't there.
+            let passed = page
+                .data
+                .last()
+                .is_none_or(|last| last.release_num < release_num);
+            if let Some(found) = page.data.into_iter().find(|r| r.release_num == release_num) {
+                return Ok(Some(found));
+            }
+            match page.next_page_token {
+                Some(token) if !passed => page_token = Some(token),
+                _ => return Ok(None),
+            }
+        }
+    }
+
+    async fn release_page(
+        &self,
+        page_size: u16,
+        page_token: Option<&str>,
+    ) -> anyhow::Result<Page<Release>> {
+        let page_size = page_size.to_string();
+        let mut query = vec![("page_size", page_size.as_str())];
+        if let Some(token) = page_token {
+            query.push(("page_token", token));
+        }
+        self.client
+            .get_whole(&format!("{}/releases", self.path), &query)
+            .await
+    }
+
+    /// Cuts a release of the bucket's files as they are now; `latest` moves to it.
+    pub async fn create_release(&self, name: &str, notes: Option<&str>) -> anyhow::Result<Release> {
+        self.client
+            .post_once(
+                &format!("{}/releases", self.path),
+                &serde_json::json!({ "name": name, "notes": notes }),
+            )
+            .await
+    }
+
+    /// How the bucket's files differ from its latest release: everything is added before the first.
+    pub async fn unreleased(&self) -> anyhow::Result<DiffSummary> {
+        self.diff(&format!("{}/compare", self.path), &[("page_size", "1")])
+            .await
+    }
+
+    /// How release `release_id` of this bucket differs from release `base_id`, which may be in
+    /// another bucket of the app.
+    pub async fn compare_releases(
+        &self,
+        release_id: &str,
+        base_id: &str,
+    ) -> anyhow::Result<DiffSummary> {
+        self.diff(
+            &format!("{}/releases/{release_id}/compare", self.path),
+            &[("base_release_id", base_id), ("page_size", "1")],
+        )
+        .await
+    }
+
+    async fn diff(&self, path: &str, query: &[(&str, &str)]) -> anyhow::Result<DiffSummary> {
+        let page: DiffPage = self.client.get_whole(path, query).await?;
+        page.summary
+            .with_context(|| format!("the API's answer to {path} had no summary"))
+    }
+
+    /// Publishes a release of this bucket in the target bucket: its files become the release's, a
+    /// new release is cut there, and `latest` and the given tags move to it, all or nothing. Each
+    /// tag comes with the revision it was read at, none for a tag to create.
+    pub async fn promote(
+        &self,
+        release_id: &str,
+        target_environment_id: &str,
+        target_bucket_id: &str,
+        tags: &[(String, Option<u64>)],
+    ) -> anyhow::Result<Release> {
+        let tags: Vec<_> = tags
+            .iter()
+            .map(|(id, revision)| serde_json::json!({ "id": id, "expected_revision": revision }))
+            .collect();
+        self.client
+            .post_once(
+                &format!("{}/releases/{release_id}/promote", self.path),
+                &serde_json::json!({
+                    "target_environment_id": target_environment_id,
+                    "target_bucket_id": target_bucket_id,
+                    "tags": tags,
+                }),
+            )
+            .await
+    }
+
+    /// The bucket's tags, by name. `latest` is among them once there's a release.
+    pub async fn tags(&self) -> anyhow::Result<Vec<Tag>> {
+        self.client.get(&format!("{}/tags", self.path)).await
+    }
+
+    /// Points a tag at a release: creates it when `revision` is none, or moves it from the state
+    /// read at `revision`, so a move made meanwhile isn't overwritten.
+    pub async fn set_tag(
+        &self,
+        tag_id: &str,
+        release_id: &str,
+        revision: Option<u64>,
+    ) -> anyhow::Result<Tag> {
+        self.client
+            .put(
+                &format!("{}/tags/{tag_id}", self.path),
+                &serde_json::json!({ "release_id": release_id, "expected_revision": revision }),
+            )
+            .await
+    }
+
+    /// Asks where to upload files. A file the bucket already has, with the same content and type,
+    /// comes back with no upload. The others get a signed URL to PUT to, which must start within
+    /// five minutes, and their bytes are reserved against the org's storage until completed or
+    /// cancelled.
+    pub async fn prepare_uploads(
+        &self,
+        items: &[PrepareItem<'_>],
+    ) -> anyhow::Result<Vec<Prepared>> {
+        self.client
+            .post(
+                &format!("{}/uploads/prepare", self.path),
+                &serde_json::json!({ "items": items }),
+            )
+            .await
+    }
+
+    /// Records uploaded files as their paths' new content. Each answers its own status.
+    pub async fn complete_uploads(&self, items: &[UploadToken]) -> anyhow::Result<Vec<Completed>> {
+        self.client
+            .post(
+                &format!("{}/uploads/complete", self.path),
+                &serde_json::json!({ "items": items }),
+            )
+            .await
+    }
+
+    /// Gives up prepared uploads that weren't completed, freeing the room they reserved.
+    pub async fn cancel_uploads(&self, items: &[UploadToken]) -> anyhow::Result<()> {
+        self.client
+            .post_empty(
+                &format!("{}/uploads/cancel", self.path),
+                &serde_json::json!({ "items": items }),
+            )
+            .await
+    }
+
+    /// Removes files from the bucket, all or none: each must still be at the revision given.
+    pub async fn delete_entries(&self, items: &[EntryRevision]) -> anyhow::Result<()> {
+        self.client
+            .post_empty(
+                &format!("{}/entries/batch_delete", self.path),
+                &serde_json::json!({ "items": items }),
+            )
+            .await
+    }
+}
+
 /// A key no other request has: the time, this process and the path, hashed.
 fn idempotency_key(path: &str) -> String {
     let nanos = std::time::SystemTime::now()
@@ -470,14 +459,16 @@ fn idempotency_key(path: &str) -> String {
         .collect()
 }
 
-/// The API path of a bucket, which its files, uploads, releases and tags hang off.
-pub fn bucket_path(app_id: &str, environment_id: &str, bucket_id: &str) -> String {
-    format!("/storage/v1/apps/{app_id}/environments/{environment_id}/buckets/{bucket_id}")
-}
-
 #[derive(Deserialize)]
 struct Data<T> {
     data: T,
+}
+
+/// One page of a list, with the token that fetches the next.
+#[derive(Deserialize)]
+struct Page<T> {
+    data: Vec<T>,
+    next_page_token: Option<String>,
 }
 
 /// The API refused the token, or Toaba ended the login: the token is unknown, expired or revoked.
@@ -536,7 +527,6 @@ impl Error {
         }
     }
 
-    #[allow(dead_code, reason = "the foundation for the commands to come")]
     pub fn is(&self, code: &str) -> bool {
         self.code.as_deref() == Some(code)
     }
@@ -678,7 +668,7 @@ pub struct PublishableKey {
 }
 
 /// An environment of an app's assets, such as `production`.
-#[derive(Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize)]
 pub struct Environment {
     pub id: String,
     #[serde(deserialize_with = "plain")]
@@ -835,19 +825,6 @@ struct DiffPage {
     summary: Option<DiffSummary>,
 }
 
-#[derive(Deserialize)]
-struct ReleasePage {
-    data: Vec<Release>,
-    next_page_token: Option<String>,
-}
-
-/// One page of a bucket's files.
-#[derive(Deserialize)]
-struct EntryPage {
-    data: Vec<Entry>,
-    next_page_token: Option<String>,
-}
-
 #[cfg(test)]
 mod tests {
     use serde_json::json;
@@ -919,7 +896,8 @@ mod tests {
 
         let found = client(&server)
             .await
-            .entries("app_a", "staging", "assets")
+            .bucket("app_a", "staging", "assets")
+            .entries()
             .await
             .unwrap();
         let paths: Vec<&str> = found.iter().map(|entry| entry.path.as_str()).collect();
@@ -951,8 +929,9 @@ mod tests {
             .mount(&server)
             .await;
 
-        let bucket = bucket_path("app_a", "staging", "assets");
-        let (releases, more) = client(&server).await.releases(&bucket, 2).await.unwrap();
+        let client = client(&server).await;
+        let bucket = client.bucket("app_a", "staging", "assets");
+        let (releases, more) = bucket.releases(2).await.unwrap();
         assert!(more);
         assert_eq!(releases[0].release_num, 2);
         assert_eq!(releases[0].tags[0].id, "latest");
@@ -977,10 +956,10 @@ mod tests {
             .mount(&server)
             .await;
 
-        let bucket = bucket_path("app_a", "staging", "assets");
         let release = client(&server)
             .await
-            .create_release(&bucket, "v2", None)
+            .bucket("app_a", "staging", "assets")
+            .create_release("v2", None)
             .await
             .unwrap();
         assert_eq!(release.release_num, 2);
@@ -997,17 +976,17 @@ mod tests {
             .mount(&server)
             .await;
 
-        let bucket = bucket_path("app_a", "production", "assets");
         let err = client(&server)
             .await
-            .create_release(&bucket, "v2", None)
+            .bucket("app_a", "production", "assets")
+            .create_release("v2", None)
             .await
             .unwrap_err();
         assert!(err.downcast_ref::<Error>().unwrap().is("promotion_only"));
     }
 
     #[tokio::test]
-    async fn a_release_is_found_by_its_number_or_reported_missing() {
+    async fn a_release_is_found_by_its_number_or_not_at_all() {
         let server = MockServer::start().await;
         let release = |num: u64| {
             json!({ "id": format!("r{num}"), "release_num": num, "name": "v", "notes": null,
@@ -1032,12 +1011,11 @@ mod tests {
             .mount(&server)
             .await;
 
-        let bucket = bucket_path("app_a", "staging", "assets");
         let client = client(&server).await;
-        assert_eq!(client.release_by_num(&bucket, 3).await.unwrap().id, "r3");
-        let missing = client.release_by_num(&bucket, 2).await.unwrap_err();
-        assert_eq!(message(missing), "the bucket has no release #2");
-        assert!(client.release_by_num(&bucket, 9).await.is_err());
+        let bucket = client.bucket("app_a", "staging", "assets");
+        assert_eq!(bucket.release_by_num(3).await.unwrap().unwrap().id, "r3");
+        assert!(bucket.release_by_num(2).await.unwrap().is_none());
+        assert!(bucket.release_by_num(9).await.unwrap().is_none());
     }
 
     #[test]

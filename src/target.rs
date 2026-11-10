@@ -32,6 +32,109 @@ pub struct Reached {
     pub app_name: String,
 }
 
+/// A bucket the app is known to have: its name, what the API says about it, and its calls, which
+/// it derefs to.
+pub struct Bucket<'a> {
+    pub name: BucketRef,
+    pub info: api::Bucket,
+    api: api::BucketApi<'a>,
+}
+
+impl<'a> std::ops::Deref for Bucket<'a> {
+    type Target = api::BucketApi<'a>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.api
+    }
+}
+
+impl std::fmt::Display for Bucket<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.name.fmt(f)
+    }
+}
+
+impl Bucket<'_> {
+    /// A release named as people name one: by its number, or by a tag of the bucket pointing at it.
+    pub async fn release(&self, release: &str) -> anyhow::Result<api::Release> {
+        let release_num = match release.trim_start_matches('#').parse::<u64>() {
+            Ok(num) => num,
+            Err(_) => self
+                .tags()
+                .await?
+                .into_iter()
+                .find(|tag| tag.id == release)
+                .map(|tag| tag.release.release_num)
+                .with_context(|| {
+                    format!("{release} is neither a release number nor a tag of {self}")
+                })?,
+        };
+        self.release_by_num(release_num)
+            .await?
+            .with_context(|| format!("{self} has no release #{release_num}"))
+    }
+}
+
+impl Target {
+    /// The app's bucket. Fails when the app has none by that name, naming the ones it has.
+    pub async fn bucket(&self, name: &BucketRef) -> anyhow::Result<Bucket<'_>> {
+        // An unknown environment answers not found, which the walk below turns into the list.
+        let in_environment = match self
+            .client
+            .buckets(&self.app_id, &name.environment_id)
+            .await
+        {
+            Ok(buckets) => buckets,
+            Err(err)
+                if err
+                    .downcast_ref::<api::Error>()
+                    .is_some_and(|e| e.is("not_found")) =>
+            {
+                Vec::new()
+            }
+            Err(err) => return Err(err),
+        };
+        if let Some(info) = in_environment.into_iter().find(|b| b.id == name.bucket_id) {
+            return Ok(Bucket {
+                api: self
+                    .client
+                    .bucket(&self.app_id, &name.environment_id, &name.bucket_id),
+                name: name.clone(),
+                info,
+            });
+        }
+
+        let known: Vec<String> = self
+            .buckets()
+            .await?
+            .iter()
+            .map(|(environment, bucket)| format!("{}/{}", environment.id, bucket.id))
+            .collect();
+        if known.is_empty() {
+            bail!(
+                "{} has no buckets yet, create one in the dashboard",
+                self.app_name
+            );
+        }
+        bail!(
+            "{} has no bucket {name}, it has: {}",
+            self.app_name,
+            known.join(", ")
+        )
+    }
+
+    /// Every bucket of the app, with its environment, by environment and then bucket.
+    pub async fn buckets(&self) -> anyhow::Result<Vec<(api::Environment, api::Bucket)>> {
+        let mut buckets = Vec::new();
+        for environment in self.client.environments(&self.app_id).await? {
+            for bucket in self.client.buckets(&self.app_id, &environment.id).await? {
+                buckets.push((environment.clone(), bucket));
+            }
+        }
+        Ok(buckets)
+    }
+}
+
 pub async fn app(arg: AppArg) -> anyhow::Result<Target> {
     if let Some(credential) = auth::from_env() {
         return from_env(credential, arg.app).await;
@@ -237,39 +340,21 @@ impl std::fmt::Display for BucketRef {
     }
 }
 
-impl BucketRef {
-    /// Fails unless the app has this bucket, naming the buckets it does have.
-    pub async fn check(&self, target: &Target) -> anyhow::Result<()> {
-        let mut known = Vec::new();
-        for environment in target.client.environments(&target.app_id).await? {
-            for bucket in target
-                .client
-                .buckets(&target.app_id, &environment.id)
-                .await?
-            {
-                if environment.id == self.environment_id && bucket.id == self.bucket_id {
-                    return Ok(());
-                }
-                known.push(format!("{}/{}", environment.id, bucket.id));
-            }
-        }
-        if known.is_empty() {
-            bail!(
-                "{} has no buckets yet, create one in the dashboard",
-                target.app_name
-            );
-        }
-        bail!(
-            "{} has no bucket {self}, it has: {}",
-            target.app_name,
-            known.join(", ")
-        )
+/// A tag to set, as a command's argument: an id people choose, and not `latest`, which follows new
+/// releases by itself.
+pub fn tag_name(text: &str) -> Result<String, String> {
+    if text == "latest" {
+        Err("latest follows new releases by itself and can't be set".to_string())
+    } else if is_slug(text) {
+        Ok(text.to_string())
+    } else {
+        Err("a tag is lowercase letters, digits and hyphens, starting with a letter".to_string())
     }
 }
 
 /// An id people choose: a lowercase letter, then lowercase letters and digits in parts joined by
 /// single hyphens, 63 characters at most.
-pub fn is_slug(text: &str) -> bool {
+fn is_slug(text: &str) -> bool {
     text.len() <= 63
         && text.starts_with(|first: char| first.is_ascii_lowercase())
         && text.split('-').all(|part| {

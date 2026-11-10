@@ -8,6 +8,30 @@ use dialoguer::{Confirm, Select};
 
 use crate::theme;
 
+/// The flag every command that changes something takes.
+#[derive(clap::Args)]
+pub struct YesArg {
+    /// Go ahead without asking; needed where there's nobody to ask, as in CI
+    #[arg(short, long)]
+    pub yes: bool,
+}
+
+impl YesArg {
+    /// Fails with `why` where a question would come later and there'd be nobody to answer it, so
+    /// a command says so before doing any work.
+    pub fn require(&self, why: &str) -> anyhow::Result<()> {
+        if !self.yes && !interactive() {
+            bail!("{why}");
+        }
+        Ok(())
+    }
+
+    /// Asks before changing something, unless `--yes` was passed.
+    pub fn confirm(&self, question: &str) -> anyhow::Result<()> {
+        confirm_or_yes(question, self.yes)
+    }
+}
+
 /// Whether a person can answer: stdin and stderr are terminals, and it isn't CI.
 pub fn interactive() -> bool {
     std::io::stdin().is_terminal()

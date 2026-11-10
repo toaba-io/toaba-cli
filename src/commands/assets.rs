@@ -9,8 +9,9 @@ use console::style;
 use indicatif::{HumanBytes, ProgressBar};
 use serde_json::json;
 
-use crate::output::{Output, few, pad, plain, print_json, short, width};
-use crate::target::{self, AppArg, BucketRef};
+use crate::output::{Output, few, pad, plain, print_json, short, table, width};
+use crate::prompt::YesArg;
+use crate::target::{self, AppArg, Bucket, BucketRef, tag_name};
 use crate::{api, progress, prompt, sync, theme};
 
 #[derive(Subcommand)]
@@ -47,9 +48,8 @@ pub enum Command {
         /// Point this tag of the target bucket at the new release; repeatable
         #[arg(long, value_parser = tag_name)]
         tag: Vec<String>,
-        /// Go ahead without asking; needed where there's nobody to ask, as in CI
-        #[arg(short, long)]
-        yes: bool,
+        #[command(flatten)]
+        yes: YesArg,
     },
     /// Make a bucket's files match a local folder
     ///
@@ -68,9 +68,8 @@ pub enum Command {
         /// Leave out local files matching this pattern, such as '*.meta'; repeatable
         #[arg(long, value_name = "GLOB")]
         exclude: Vec<String>,
-        /// Go ahead without asking; needed where there's nobody to ask, as in CI
-        #[arg(short, long)]
-        yes: bool,
+        #[command(flatten)]
+        yes: YesArg,
         /// How many files to upload at once
         #[arg(long, default_value_t = 8, value_parser = clap::value_parser!(u8).range(1..=32))]
         concurrency: u8,
@@ -123,9 +122,8 @@ pub enum ReleaseCommand {
         /// Notes to keep with the release
         #[arg(long)]
         notes: Option<String>,
-        /// Go ahead without asking; needed where there's nobody to ask, as in CI
-        #[arg(short, long)]
-        yes: bool,
+        #[command(flatten)]
+        yes: YesArg,
     },
 }
 
@@ -154,19 +152,9 @@ pub enum TagCommand {
         release: String,
         #[command(flatten)]
         app: AppArg,
-        /// Go ahead without asking; needed where there's nobody to ask, as in CI
-        #[arg(short, long)]
-        yes: bool,
+        #[command(flatten)]
+        yes: YesArg,
     },
-}
-
-/// A tag's name: lowercase letters, digits and single hyphens, starting with a letter.
-fn tag_name(text: &str) -> Result<String, String> {
-    if target::is_slug(text) {
-        Ok(text.to_string())
-    } else {
-        Err("a tag is lowercase letters, digits and hyphens, starting with a letter".to_string())
-    }
 }
 
 pub async fn run(command: Command, output: Output) -> anyhow::Result<()> {
@@ -234,10 +222,22 @@ pub async fn run(command: Command, output: Output) -> anyhow::Result<()> {
     }
 }
 
+/// `· 4 files, 195 KiB`, dimmed, to end the line that announces a release.
+fn release_size(release: &api::Release) -> String {
+    style(format!(
+        "· {} files, {}",
+        release.entry_count,
+        HumanBytes(release.size_bytes)
+    ))
+    .dim()
+    .for_stderr()
+    .to_string()
+}
+
 struct SyncOptions {
     dry_run: bool,
     exclude: Vec<String>,
-    yes: bool,
+    yes: YesArg,
     concurrency: usize,
     release: Option<String>,
     notes: Option<String>,
@@ -251,28 +251,20 @@ async fn sync(
     options: SyncOptions,
     output: Output,
 ) -> anyhow::Result<()> {
-    if options.tags.iter().any(|tag| tag == "latest") {
-        bail!("latest follows new releases by itself and can't be set");
-    }
-    // Asked for up front, before any work, where there'd be nobody to confirm later.
-    if !options.dry_run && !options.yes && !prompt::interactive() {
-        bail!("sync changes the bucket: pass --yes to go ahead, or --dry-run to only look");
+    if !options.dry_run {
+        options.yes.require(
+            "sync changes the bucket: pass --yes to go ahead, or --dry-run to only look",
+        )?;
     }
     let files = sync::scan(&dir, &options.exclude)?;
     // Found before the spinner starts, since finding it may ask which app.
     let target = target::app(arg).await?;
-
-    let line = progress::start("Reading the bucket…");
-    let remote = async {
-        bucket.check(&target).await?;
-        target
-            .client
-            .entries(&target.app_id, &bucket.environment_id, &bucket.bucket_id)
-            .await
-    }
-    .await
-    .inspect_err(|_| progress::failed(&line, "Reading the bucket"))?;
-    line.finish_and_clear();
+    let (bucket, remote) = progress::during("Reading the bucket…", async {
+        let bucket = target.bucket(&bucket).await?;
+        let remote = bucket.entries().await?;
+        Ok((bucket, remote))
+    })
+    .await?;
 
     let total: u64 = files.iter().map(|(_, _, size)| size).sum();
     let bar = ProgressBar::new(total).with_style(progress::bytes("Hashing"));
@@ -288,7 +280,7 @@ async fn sync(
     // With -o json the plan is still shown to the person asked to confirm, on stderr.
     if output == Output::Text {
         print!("{}", plan_text(&plan, true));
-    } else if applies && !options.yes {
+    } else if applies && !options.yes.yes {
         eprint!("{}", plan_text(&plan, false));
     }
 
@@ -303,25 +295,16 @@ async fn sync(
             ),
             None => format!("Sync {bucket} like this?"),
         };
-        prompt::confirm_or_yes(&question, options.yes)?;
+        options.yes.confirm(&question)?;
         let bar = ProgressBar::new(plan.upload_bytes()).with_style(progress::bytes("Uploading"));
-        let path = api::bucket_path(&target.app_id, &bucket.environment_id, &bucket.bucket_id);
-        sync::apply(
-            &target.client,
-            &path,
-            &local,
-            &remote,
-            &plan,
-            options.concurrency,
-            &bar,
-        )
-        .await
-        .inspect_err(|_| bar.abandon())?;
+        sync::apply(&bucket, &local, &remote, &plan, options.concurrency, &bar)
+            .await
+            .inspect_err(|_| bar.abandon())?;
         bar.finish_and_clear();
         eprintln!(
             "{} Synced {} in {}",
             theme::accent().apply_to("✓"),
-            style(&bucket).bold().for_stderr(),
+            style(&bucket.name).bold().for_stderr(),
             target.app_name
         );
     }
@@ -331,19 +314,16 @@ async fn sync(
     let mut release = None;
     let mut tags = Vec::new();
     if let (Some(name), false) = (&options.release, options.dry_run) {
-        let confirmed = options.yes || applies;
-        release = cut_release(
-            &target,
-            &bucket,
+        let cut = CutRelease {
             name,
-            options.notes.as_deref(),
-            &options.tags,
-            confirmed,
-            applies,
-        )
-        .await?;
+            notes: options.notes.as_deref(),
+            tags: &options.tags,
+            confirmed: options.yes.yes || applies,
+            shown: applies,
+        };
+        release = cut_release(&bucket, cut).await?;
         match &release {
-            Some(release) => tags = point_tags(&target, &bucket, &options.tags, release).await?,
+            Some(release) => tags = point_tags(&bucket, &options.tags, release).await?,
             None if options.tags.is_empty() => {
                 eprintln!("Nothing new to release: {bucket} matches its latest release");
             }
@@ -371,16 +351,7 @@ async fn sync(
 
 /// The plan's changes, a line each, then its summary; coloured for stdout or for stderr.
 fn plan_text(plan: &sync::Plan, stdout: bool) -> String {
-    let mark = |style: console::Style, mark: &'static str| {
-        let style = if stdout {
-            style.for_stdout()
-        } else {
-            style.for_stderr()
-        };
-        style.apply_to(mark).to_string()
-    };
-    let dim = |text: &str| {
-        let style = console::Style::new().dim();
+    let paint = |style: console::Style, text: &str| {
         let style = if stdout {
             style.for_stdout()
         } else {
@@ -388,10 +359,11 @@ fn plan_text(plan: &sync::Plan, stdout: bool) -> String {
         };
         style.apply_to(text).to_string()
     };
+    let dim = |text: &str| paint(console::Style::new().dim(), text);
     let groups = [
-        (mark(theme::accent(), "+"), &plan.new, "new"),
-        (mark(theme::accent(), "~"), &plan.changed, "changed"),
-        (mark(theme::failure(), "-"), &plan.removed, "to remove"),
+        (paint(theme::accent(), "+"), &plan.new, "new"),
+        (paint(theme::accent(), "~"), &plan.changed, "changed"),
+        (paint(theme::failure(), "-"), &plan.removed, "to remove"),
     ];
     let all = || groups.iter().flat_map(|(_, changes, _)| changes.iter());
     let path_width = width("", all().map(|change| &change.path));
@@ -434,24 +406,22 @@ async fn create_release(
     name: String,
     arg: AppArg,
     notes: Option<String>,
-    yes: bool,
+    yes: YesArg,
     output: Output,
 ) -> anyhow::Result<()> {
-    if !yes && !prompt::interactive() {
-        bail!("cutting a release moves the bucket's latest tag: pass --yes to go ahead");
-    }
+    yes.require("cutting a release moves the bucket's latest tag: pass --yes to go ahead")?;
     // Found before the spinner starts, since finding it may ask which app.
     let target = target::app(arg).await?;
-    let line = progress::start("Reading the bucket…");
-    bucket
-        .check(&target)
-        .await
-        .inspect_err(|_| progress::failed(&line, "Reading the bucket"))?;
-    line.finish_and_clear();
+    let bucket = progress::during("Reading the bucket…", target.bucket(&bucket)).await?;
 
-    let Some(release) =
-        cut_release(&target, &bucket, &name, notes.as_deref(), &[], yes, false).await?
-    else {
+    let cut = CutRelease {
+        name: &name,
+        notes: notes.as_deref(),
+        tags: &[],
+        confirmed: yes.yes,
+        shown: false,
+    };
+    let Some(release) = cut_release(&bucket, cut).await? else {
         bail!("{bucket} has nothing new to release: its files match the latest release");
     };
     if output == Output::Json {
@@ -462,33 +432,27 @@ async fn create_release(
 
 /// Points each tag at the release just cut, creating the tag or moving it.
 async fn point_tags(
-    target: &target::Target,
-    bucket: &BucketRef,
+    bucket: &Bucket<'_>,
     tags: &[String],
     release: &api::Release,
 ) -> anyhow::Result<Vec<api::Tag>> {
     if tags.is_empty() {
         return Ok(Vec::new());
     }
-    let path = api::bucket_path(&target.app_id, &bucket.environment_id, &bucket.bucket_id);
-    let line = progress::start("Setting the tags…");
-    let set = async {
-        let current = target.client.tags(&path).await?;
+    let set = progress::during("Setting the tags…", async {
+        let current = bucket.tags().await?;
         let mut set = Vec::new();
         for tag in tags {
             let revision = current.iter().find(|c| &c.id == tag).map(|c| c.revision);
-            let moved = target
-                .client
-                .set_tag(&path, tag, &release.id, revision)
+            let moved = bucket
+                .set_tag(tag, &release.id, revision)
                 .await
                 .with_context(|| format!("couldn't point {tag} at #{}", release.release_num))?;
             set.push(moved);
         }
-        anyhow::Ok(set)
-    }
-    .await
-    .inspect_err(|_| progress::failed(&line, "Setting the tags"))?;
-    line.finish_and_clear();
+        Ok(set)
+    })
+    .await?;
     for tag in &set {
         eprintln!(
             "{} {} now points at #{} in {bucket}",
@@ -500,36 +464,35 @@ async fn point_tags(
     Ok(set)
 }
 
-/// Cuts a release of the bucket's files as they are now, after showing what it holds and asking,
-/// unless `confirmed`. After a sync that was just shown and agreed to, `shown`, it says neither
-/// again. None when nothing differs from the latest release.
-async fn cut_release(
-    target: &target::Target,
-    bucket: &BucketRef,
-    name: &str,
-    notes: Option<&str>,
-    tags: &[String],
+/// A release to cut, and how much to say and ask first.
+struct CutRelease<'a> {
+    name: &'a str,
+    notes: Option<&'a str>,
+    /// Tags that will be pointed at it, to name in the question.
+    tags: &'a [String],
+    /// Already agreed to, so there's nothing to ask.
     confirmed: bool,
+    /// Already shown as a sync's plan, so there's nothing to show again.
     shown: bool,
+}
+
+/// Cuts a release of the bucket's files as they are now, after showing what it holds and asking.
+/// None when nothing differs from the latest release.
+async fn cut_release(
+    bucket: &Bucket<'_>,
+    cut: CutRelease<'_>,
 ) -> anyhow::Result<Option<api::Release>> {
-    let path = api::bucket_path(&target.app_id, &bucket.environment_id, &bucket.bucket_id);
-    let line = progress::start("Reading the bucket…");
-    let unreleased = target
-        .client
-        .unreleased(&path)
-        .await
-        .inspect_err(|_| progress::failed(&line, "Reading the bucket"))?;
-    line.finish_and_clear();
+    let unreleased = progress::during("Reading the bucket…", bucket.unreleased()).await?;
     if unreleased.added + unreleased.changed + unreleased.removed == 0 {
         return Ok(None);
     }
 
-    if !shown {
+    if !cut.shown {
         let delta = HumanBytes(unreleased.size_delta.unsigned_abs());
         let sign = if unreleased.size_delta < 0 { "-" } else { "+" };
         eprintln!(
             "{} of {bucket}: {} added, {} changed, {} removed, {} unchanged ({sign}{delta})",
-            style(name).bold().for_stderr(),
+            style(cut.name).bold().for_stderr(),
             unreleased.added,
             unreleased.changed,
             unreleased.removed,
@@ -542,34 +505,24 @@ async fn cut_release(
                 .for_stderr()
         );
     }
-    let question = if tags.is_empty() {
+    let question = if cut.tags.is_empty() {
         "Cut this release?".to_string()
     } else {
-        format!("Cut this release, and point {} at it?", tags.join(", "))
+        format!("Cut this release, and point {} at it?", cut.tags.join(", "))
     };
-    prompt::confirm_or_yes(&question, confirmed)?;
+    prompt::confirm_or_yes(&question, cut.confirmed)?;
 
-    let line = progress::start("Cutting the release…");
-    let release = target
-        .client
-        .create_release(&path, name, notes)
-        .await
-        .inspect_err(|_| progress::failed(&line, "Cutting the release"))?;
-    progress::finish(
-        &line,
-        format!(
-            "{} Released {} as #{} of {bucket} {}",
-            theme::accent().apply_to("✓"),
-            style(short(&release.name, 60)).bold().for_stderr(),
-            release.release_num,
-            style(format!(
-                "· {} files, {}",
-                release.entry_count,
-                HumanBytes(release.size_bytes)
-            ))
-            .dim()
-            .for_stderr()
-        ),
+    let release = progress::during(
+        "Cutting the release…",
+        bucket.create_release(cut.name, cut.notes),
+    )
+    .await?;
+    eprintln!(
+        "{} Released {} as #{} of {bucket} {}",
+        theme::accent().apply_to("✓"),
+        style(short(&release.name, 60)).bold().for_stderr(),
+        release.release_num,
+        release_size(&release)
     );
     Ok(Some(release))
 }
@@ -580,75 +533,30 @@ async fn promote(
     to: BucketRef,
     arg: AppArg,
     tags: Vec<String>,
-    yes: bool,
+    yes: YesArg,
     output: Output,
 ) -> anyhow::Result<()> {
-    if tags.iter().any(|tag| tag == "latest") {
-        bail!("latest follows new releases by itself and can't be set");
-    }
-    if !yes && !prompt::interactive() {
-        bail!("promoting changes the target bucket and its latest tag: pass --yes to go ahead");
-    }
+    yes.require("promoting changes the target bucket and its latest tag: pass --yes to go ahead")?;
     // Found before the spinner starts, since finding it may ask which app.
     let target = target::app(arg).await?;
-    let source_path = api::bucket_path(&target.app_id, &source.environment_id, &source.bucket_id);
-    let to_path = api::bucket_path(&target.app_id, &to.environment_id, &to.bucket_id);
-
-    let line = progress::start("Reading the buckets…");
-    let read = async {
-        source.check(&target).await?;
-        let release_num = match release.trim_start_matches('#').parse::<u64>() {
-            Ok(num) => num,
-            Err(_) => target
-                .client
-                .tags(&source_path)
-                .await?
-                .into_iter()
-                .find(|tag| tag.id == release)
-                .map(|tag| tag.release.release_num)
-                .with_context(|| {
-                    format!("{release} is neither a release number nor a tag of {source}")
-                })?,
-        };
-        let from = target
-            .client
-            .release_by_num(&source_path, release_num)
-            .await
-            .map_err(|err| {
-                // Only the not-found answer is reworded to name the bucket.
-                if err.to_string().starts_with("the bucket has no release") {
-                    anyhow::anyhow!("{source} has no release #{release_num}")
-                } else {
-                    err
-                }
-            })?;
-
-        to.check(&target).await?;
-        let unreleased = target
-            .client
-            .buckets(&target.app_id, &to.environment_id)
-            .await?
-            .into_iter()
-            .find(|bucket| bucket.id == to.bucket_id)
-            .map_or(0, |bucket| bucket.unreleased_count);
-        let to_tags = target.client.tags(&to_path).await?;
+    let (source, from, to, to_tags, diff) = progress::during("Reading the buckets…", async {
+        let source = target.bucket(&source).await?;
+        let from = source.release(&release).await?;
+        let to = target.bucket(&to).await?;
+        let to_tags = to.tags().await?;
         // Against what the target's players have now: its latest release, if it has one.
-        let current = to_tags.iter().find(|tag| tag.id == "latest");
-        let diff = match current {
+        let diff = match to_tags.iter().find(|tag| tag.id == "latest") {
             Some(latest) => Some(
-                target
-                    .client
-                    .compare_releases(&source_path, &from.id, &latest.release.id)
+                source
+                    .compare_releases(&from.id, &latest.release.id)
                     .await?,
             ),
             None => None,
         };
-        anyhow::Ok((from, unreleased, to_tags, diff))
-    }
-    .await;
-    let (from, unreleased, to_tags, diff) =
-        read.inspect_err(|_| progress::failed(&line, "Reading the buckets"))?;
-    line.finish_and_clear();
+        Ok((source, from, to, to_tags, diff))
+    })
+    .await?;
+    let unreleased = to.info.unreleased_count;
 
     let bold = |text: &str| style(text.to_string()).bold().for_stderr();
     let dim = |text: String| style(text).dim().for_stderr();
@@ -713,33 +621,24 @@ async fn promote(
             }
         ))
     );
-    prompt::confirm_or_yes("Promote?", yes)?;
+    yes.confirm("Promote?")?;
 
-    let line = progress::start("Promoting…");
-    let promoted = target
-        .client
-        .promote(
-            &source_path,
+    let promoted = progress::during(
+        "Promoting…",
+        source.promote(
             &from.id,
-            &to.environment_id,
-            &to.bucket_id,
+            &to.name.environment_id,
+            &to.name.bucket_id,
             &moves,
-        )
-        .await
-        .inspect_err(|_| progress::failed(&line, "Promoting"))?;
-    progress::finish(
-        &line,
-        format!(
-            "{} Promoted {} to {to} as #{} {}",
-            theme::accent().apply_to("✓"),
-            bold(&from_label),
-            promoted.release_num,
-            dim(format!(
-                "· {} files, {}",
-                promoted.entry_count,
-                HumanBytes(promoted.size_bytes)
-            ))
         ),
+    )
+    .await?;
+    eprintln!(
+        "{} Promoted {} to {to} as #{} {}",
+        theme::accent().apply_to("✓"),
+        bold(&from_label),
+        promoted.release_num,
+        release_size(&promoted)
     );
     if output == Output::Json {
         print_json(&promoted)?;
@@ -752,46 +651,18 @@ async fn set_tag(
     bucket: BucketRef,
     release: String,
     arg: AppArg,
-    yes: bool,
+    yes: YesArg,
     output: Output,
 ) -> anyhow::Result<()> {
-    if tag == "latest" {
-        bail!("latest follows new releases by itself and can't be set");
-    }
     // Found before the spinner starts, since finding it may ask which app.
     let target = target::app(arg).await?;
-    let path = api::bucket_path(&target.app_id, &bucket.environment_id, &bucket.bucket_id);
-    let line = progress::start("Reading the bucket…");
-    let read = async {
-        bucket.check(&target).await?;
-        let tags = target.client.tags(&path).await?;
-        let release_num = match release.trim_start_matches('#').parse::<u64>() {
-            Ok(num) => num,
-            Err(_) => tags
-                .iter()
-                .find(|other| other.id == release)
-                .map(|other| other.release.release_num)
-                .with_context(|| {
-                    format!("{release} is neither a release number nor a tag of {bucket}")
-                })?,
-        };
-        let to = target
-            .client
-            .release_by_num(&path, release_num)
-            .await
-            .map_err(|err| {
-                // Only the not-found answer is reworded to name the bucket.
-                if err.to_string().starts_with("the bucket has no release") {
-                    anyhow::anyhow!("{bucket} has no release #{release_num}")
-                } else {
-                    err
-                }
-            })?;
-        anyhow::Ok((tags.into_iter().find(|current| current.id == tag), to))
-    }
-    .await;
-    let (current, to) = read.inspect_err(|_| progress::failed(&line, "Reading the bucket"))?;
-    line.finish_and_clear();
+    let (bucket, current, to) = progress::during("Reading the bucket…", async {
+        let bucket = target.bucket(&bucket).await?;
+        let to = bucket.release(&release).await?;
+        let current = bucket.tags().await?.into_iter().find(|t| t.id == tag);
+        Ok((bucket, current, to))
+    })
+    .await?;
 
     let bold = |text: &str| style(text.to_string()).bold().for_stderr();
     let to_label = format!("#{} {}", to.release_num, short(&to.name, 60));
@@ -817,32 +688,20 @@ async fn set_tag(
             .dim()
             .for_stderr()
         );
-        prompt::confirm_or_yes(&format!("Move {tag}?"), yes)?;
+        yes.confirm(&format!("Move {tag}?"))?;
     }
 
-    let line = progress::start("Setting the tag…");
-    let set = target
-        .client
-        .set_tag(
-            &path,
-            &tag,
-            &to.id,
-            current.as_ref().map(|current| current.revision),
-        )
-        .await
-        .inspect_err(|_| progress::failed(&line, "Setting the tag"))?;
-    progress::finish(
-        &line,
-        format!(
-            "{} {} {} {to_label} in {bucket}",
-            theme::accent().apply_to("✓"),
-            bold(&tag),
-            if current.is_some() {
-                "now points at"
-            } else {
-                "created, pointing at"
-            },
-        ),
+    let revision = current.as_ref().map(|current| current.revision);
+    let set = progress::during("Setting the tag…", bucket.set_tag(&tag, &to.id, revision)).await?;
+    eprintln!(
+        "{} {} {} {to_label} in {bucket}",
+        theme::accent().apply_to("✓"),
+        bold(&tag),
+        if current.is_some() {
+            "now points at"
+        } else {
+            "created, pointing at"
+        },
     );
     if output == Output::Json {
         print_json(&set)?;
@@ -853,15 +712,10 @@ async fn set_tag(
 async fn list_tags(bucket: BucketRef, arg: AppArg, output: Output) -> anyhow::Result<()> {
     // Found before the spinner starts, since finding it may ask which app.
     let target = target::app(arg).await?;
-    let line = progress::start("Loading the tags…");
-    let loaded = async {
-        bucket.check(&target).await?;
-        let path = api::bucket_path(&target.app_id, &bucket.environment_id, &bucket.bucket_id);
-        target.client.tags(&path).await
-    }
-    .await;
-    let tags = loaded.inspect_err(|_| progress::failed(&line, "Loading the tags"))?;
-    line.finish_and_clear();
+    let tags = progress::during("Loading the tags…", async {
+        target.bucket(&bucket).await?.tags().await
+    })
+    .await?;
 
     if output == Output::Json {
         return print_json(&json!({ "tags": tags }));
@@ -870,7 +724,6 @@ async fn list_tags(bucket: BucketRef, arg: AppArg, output: Output) -> anyhow::Re
         eprintln!("{bucket} has no tags yet: latest appears with its first release");
         return Ok(());
     }
-
     let rows: Vec<[String; 4]> = tags
         .iter()
         .map(|tag| {
@@ -885,22 +738,7 @@ async fn list_tags(bucket: BucketRef, arg: AppArg, output: Output) -> anyhow::Re
             ]
         })
         .collect();
-    let headers = ["TAG", "RELEASE", "BEFORE", "MOVED"];
-    let widths: Vec<usize> = (0..headers.len())
-        .map(|column| width(headers[column], rows.iter().map(|row| &row[column])))
-        .collect();
-    let print = |cells: [&str; 4]| {
-        let padded: Vec<String> = cells
-            .iter()
-            .zip(&widths)
-            .map(|(cell, width)| pad(cell, *width))
-            .collect();
-        println!("{}", padded.join("  ").trim_end());
-    };
-    print(headers);
-    for row in &rows {
-        print([&row[0], &row[1], &row[2], &row[3]]);
-    }
+    table(["TAG", "RELEASE", "BEFORE", "MOVED"], &rows);
     Ok(())
 }
 
@@ -912,16 +750,10 @@ async fn list_releases(
 ) -> anyhow::Result<()> {
     // Found before the spinner starts, since finding it may ask which app.
     let target = target::app(arg).await?;
-    let line = progress::start("Loading the releases…");
-    let loaded = async {
-        bucket.check(&target).await?;
-        let path = api::bucket_path(&target.app_id, &bucket.environment_id, &bucket.bucket_id);
-        target.client.releases(&path, limit).await
-    }
-    .await;
-    let (releases, more) =
-        loaded.inspect_err(|_| progress::failed(&line, "Loading the releases"))?;
-    line.finish_and_clear();
+    let (releases, more) = progress::during("Loading the releases…", async {
+        target.bucket(&bucket).await?.releases(limit).await
+    })
+    .await?;
 
     if output == Output::Json {
         return print_json(&json!({ "releases": releases, "more": more }));
@@ -930,7 +762,6 @@ async fn list_releases(
         eprintln!("{bucket} has no releases yet");
         return Ok(());
     }
-
     let rows: Vec<[String; 6]> = releases
         .iter()
         .map(|release| {
@@ -953,22 +784,10 @@ async fn list_releases(
             ]
         })
         .collect();
-    let headers = ["RELEASE", "NAME", "FILES", "SIZE", "CREATED", "TAGS"];
-    let widths: Vec<usize> = (0..headers.len())
-        .map(|column| width(headers[column], rows.iter().map(|row| &row[column])))
-        .collect();
-    let print = |cells: [&str; 6]| {
-        let padded: Vec<String> = cells
-            .iter()
-            .zip(&widths)
-            .map(|(cell, width)| pad(cell, *width))
-            .collect();
-        println!("{}", padded.join("  ").trim_end());
-    };
-    print(headers);
-    for row in &rows {
-        print([&row[0], &row[1], &row[2], &row[3], &row[4], &row[5]]);
-    }
+    table(
+        ["RELEASE", "NAME", "FILES", "SIZE", "CREATED", "TAGS"],
+        &rows,
+    );
     if more {
         eprintln!("Showing the newest {limit}, pass --limit for more");
     }
@@ -978,34 +797,16 @@ async fn list_releases(
 async fn list_buckets(arg: AppArg, output: Output) -> anyhow::Result<()> {
     // Found before the spinner starts, since finding it may ask which app.
     let target = target::app(arg).await?;
-    let line = progress::start("Loading the buckets…");
-    let loaded = async {
-        let mut buckets = Vec::new();
-        for environment in target.client.environments(&target.app_id).await? {
-            let found = target
-                .client
-                .buckets(&target.app_id, &environment.id)
-                .await?;
-            buckets.extend(
-                found
-                    .into_iter()
-                    .map(|bucket| (environment.id.clone(), environment.name.clone(), bucket)),
-            );
-        }
-        anyhow::Ok(buckets)
-    }
-    .await;
-    let buckets = loaded.inspect_err(|_| progress::failed(&line, "Loading the buckets"))?;
-    line.finish_and_clear();
+    let buckets = progress::during("Loading the buckets…", target.buckets()).await?;
 
     if output == Output::Json {
         let buckets: Vec<_> = buckets
             .iter()
-            .map(|(environment_id, environment_name, bucket)| {
+            .map(|(environment, bucket)| {
                 json!({
                     "id": bucket.id,
                     "name": bucket.name,
-                    "environment": { "id": environment_id, "name": environment_name },
+                    "environment": { "id": environment.id, "name": environment.name },
                     "write_access": bucket.write_access,
                     "release_count": bucket.release_count,
                     "unreleased_count": bucket.unreleased_count,
@@ -1025,10 +826,9 @@ async fn list_buckets(arg: AppArg, output: Output) -> anyhow::Result<()> {
         );
         return Ok(());
     }
-
     let rows: Vec<[String; 5]> = buckets
         .iter()
-        .map(|(environment_id, _, bucket)| {
+        .map(|(environment, bucket)| {
             let write = match bucket.write_access.as_str() {
                 "promotion_only" => "promotion only".to_string(),
                 other => other.to_string(),
@@ -1039,7 +839,7 @@ async fn list_buckets(arg: AppArg, output: Output) -> anyhow::Result<()> {
                 .map(|tag| format!("{} → #{}", tag.id, tag.release.release_num))
                 .collect();
             [
-                environment_id.clone(),
+                environment.id.clone(),
                 bucket.id.clone(),
                 write,
                 bucket.unreleased_count.to_string(),
@@ -1047,21 +847,6 @@ async fn list_buckets(arg: AppArg, output: Output) -> anyhow::Result<()> {
             ]
         })
         .collect();
-    let headers = ["ENV", "BUCKET", "WRITE", "UNRELEASED", "TAGS"];
-    let widths: Vec<usize> = (0..headers.len())
-        .map(|column| width(headers[column], rows.iter().map(|row| &row[column])))
-        .collect();
-    let line = |cells: [&str; 5]| {
-        let padded: Vec<String> = cells
-            .iter()
-            .zip(&widths)
-            .map(|(cell, width)| pad(cell, *width))
-            .collect();
-        println!("{}", padded.join("  ").trim_end());
-    };
-    line(headers);
-    for row in &rows {
-        line([&row[0], &row[1], &row[2], &row[3], &row[4]]);
-    }
+    table(["ENV", "BUCKET", "WRITE", "UNRELEASED", "TAGS"], &rows);
     Ok(())
 }
