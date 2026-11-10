@@ -81,6 +81,7 @@ pub enum ReleaseCommand {
     ///
     /// The bucket's `latest` tag moves to the new release, so game clients that
     /// follow `latest` get it. Other tags stay where they are.
+    #[command(visible_alias = "new")]
     Create(release::CreateArgs),
 }
 
