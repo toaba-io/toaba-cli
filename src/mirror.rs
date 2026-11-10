@@ -13,7 +13,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context as _, bail};
 use futures_util::TryStreamExt;
 use globset::{Glob, GlobSet, GlobSetBuilder};
-use indicatif::ProgressBar;
+use indicatif::{HumanBytes, ProgressBar};
 use reqwest::header::CONTENT_LENGTH;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
@@ -23,7 +23,7 @@ use tokio_util::io::ReaderStream;
 use walkdir::WalkDir;
 
 use crate::api;
-use crate::output::CLEANS_UP_ON_CTRL_C;
+use crate::output::{CLEANS_UP_ON_CTRL_C, few};
 
 /// A file of the local folder.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -312,7 +312,15 @@ async fn upload_all(
                 content_type: &file.content_type,
             })
             .collect();
-        let prepared = bucket.prepare_uploads(&items).await?;
+        let prepared = bucket.prepare_uploads(&items).await.map_err(|err| {
+            let too_big = err
+                .downcast_ref::<api::Error>()
+                .and_then(|refused| too_big(&refused.fields, &batch));
+            match too_big {
+                Some(message) => anyhow::anyhow!(message),
+                None => err,
+            }
+        })?;
         let by_path: BTreeMap<&str, &LocalFile> = batch
             .iter()
             .map(|file| (file.path.as_str(), *file))
@@ -380,6 +388,42 @@ async fn upload_all(
         }
     }
     Ok(())
+}
+
+/// Says which files are over the org's file size limit, when that's why the API refused a batch.
+/// It names them by their place in the batch, as `items.3.size_bytes`, with the limit in bytes.
+fn too_big(fields: &BTreeMap<String, Vec<String>>, batch: &[&LocalFile]) -> Option<String> {
+    let mut limit = None;
+    let mut files = Vec::new();
+    for (field, messages) in fields {
+        let Some(index) = field
+            .strip_prefix("items.")
+            .and_then(|rest| rest.strip_suffix(".size_bytes"))
+            .and_then(|index| index.parse::<usize>().ok())
+        else {
+            continue;
+        };
+        let file = batch.get(index)?;
+        files.push(format!("{} ({})", file.path, HumanBytes(file.size_bytes)));
+        limit = limit.or_else(|| {
+            let digits: String = messages
+                .iter()
+                .flat_map(|message| message.chars())
+                .skip_while(|c| !c.is_ascii_digit())
+                .take_while(char::is_ascii_digit)
+                .collect();
+            digits.parse::<u64>().ok()
+        });
+    }
+    let limit = match limit {
+        Some(bytes) => format!("the org's {} file size limit", HumanBytes(bytes)),
+        None => "the org's file size limit".to_string(),
+    };
+    match files.len() {
+        0 => None,
+        1 => Some(format!("{} is over {limit}", files[0])),
+        n => Some(format!("{n} files are over {limit}: {}", few(&files, ", "))),
+    }
 }
 
 /// The uploads in batches of at most `BATCH_FILES` files and `BATCH_BYTES` bytes, a file bigger
@@ -528,6 +572,33 @@ mod tests {
         assert_eq!(plan.removed[0].size_bytes, 7);
         assert_eq!(plan.unchanged_count, 1);
         assert_eq!(plan.upload_bytes(), 30);
+    }
+
+    #[test]
+    fn a_refusal_for_size_names_the_files_and_the_limit() {
+        let small = local("small.txt", "aa", "text/plain");
+        let big = LocalFile {
+            path: "big.bin".into(),
+            size_bytes: 2 * 1024 * 1024 * 1024,
+            ..small.clone()
+        };
+        let batch = [&small, &big];
+        let refused = |field: &str| {
+            BTreeMap::from([(
+                field.to_string(),
+                vec![
+                    "must be at most 536870912 bytes, the organization's file size limit"
+                        .to_string(),
+                ],
+            )])
+        };
+
+        assert_eq!(
+            too_big(&refused("items.1.size_bytes"), &batch).unwrap(),
+            "big.bin (2.00 GiB) is over the org's 512.00 MiB file size limit"
+        );
+        assert_eq!(too_big(&refused("items.1.path"), &batch), None);
+        assert_eq!(too_big(&refused("items.7.size_bytes"), &batch), None);
     }
 
     #[test]
