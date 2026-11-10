@@ -20,10 +20,13 @@ use crate::{api, mirror, progress, theme};
 const ENVIRONMENT: &str = "branches";
 const ENVIRONMENT_NAME: &str = "Branches";
 
-/// A branch's name, as a command's argument: its bucket's id.
-fn branch_name(text: &str) -> Result<String, String> {
+/// A branch's name, as a command's argument: the bucket it names.
+fn branch(text: &str) -> Result<BucketRef, String> {
     if target::is_slug(text) {
-        Ok(text.to_string())
+        Ok(BucketRef {
+            environment_id: ENVIRONMENT.to_string(),
+            bucket_id: text.to_string(),
+        })
     } else {
         Err(
             "a branch is lowercase letters, digits and hyphens, starting with a letter, \
@@ -38,8 +41,8 @@ pub struct SyncArgs {
     /// The local folder
     dir: PathBuf,
     /// The branch, such as pr-123: its bucket is branches/<branch>
-    #[arg(value_parser = branch_name)]
-    branch: String,
+    #[arg(value_parser = branch)]
+    branch: BucketRef,
     /// Start a new branch from this bucket's latest release, as env/bucket, so only the files that
     /// differ are uploaded
     #[arg(long, value_name = "BUCKET")]
@@ -55,6 +58,17 @@ pub struct SyncArgs {
     yes: YesArg,
 }
 
+#[derive(clap::Args)]
+pub struct CloseArgs {
+    /// The branch, such as pr-123
+    #[arg(value_parser = branch)]
+    branch: BucketRef,
+    #[command(flatten)]
+    app: AppArg,
+    #[command(flatten)]
+    yes: YesArg,
+}
+
 /// The release a new branch starts from, and the files it holds.
 struct Start<'a> {
     source: Bucket<'a>,
@@ -65,7 +79,7 @@ struct Start<'a> {
 pub(super) async fn sync(args: SyncArgs, output: Output) -> anyhow::Result<()> {
     let SyncArgs {
         dir,
-        branch,
+        branch: name,
         from,
         release,
         app: arg,
@@ -77,11 +91,7 @@ pub(super) async fn sync(args: SyncArgs, output: Output) -> anyhow::Result<()> {
             },
         yes,
     } = args;
-    let release_name = release.unwrap_or_else(|| branch.clone());
-    let name = BucketRef {
-        environment_id: ENVIRONMENT.to_string(),
-        bucket_id: branch,
-    };
+    let release_name = release.unwrap_or_else(|| name.bucket_id.clone());
     if !dry_run {
         yes.require(
             "branch sync changes the branch's bucket: pass --yes to go ahead, or --dry-run to only \
@@ -239,6 +249,54 @@ pub(super) async fn sync(args: SyncArgs, output: Output) -> anyhow::Result<()> {
     Ok(())
 }
 
+pub(super) async fn close(args: CloseArgs, output: Output) -> anyhow::Result<()> {
+    let CloseArgs {
+        branch: name,
+        app: arg,
+        yes,
+    } = args;
+    yes.require("closing deletes the branch's bucket: pass --yes to go ahead")?;
+    // Found before the spinner starts, since finding it may ask which app.
+    let target = target::app(arg).await?;
+    let bucket = progress::during("Reading the branch…", target.find_bucket(&name)).await?;
+
+    let deleted = match bucket {
+        None => {
+            eprintln!("{name} is already gone");
+            false
+        }
+        Some(bucket) => {
+            eprintln!(
+                "Delete {} for good: {} files, {} releases",
+                style(&name).bold().for_stderr(),
+                bucket.info.entry_count,
+                bucket.info.release_count
+            );
+            eprintln!(
+                "{}",
+                style("Game builds pointed at it get nothing from then on")
+                    .dim()
+                    .for_stderr()
+            );
+            yes.confirm(&format!("Delete {name}?"))?;
+            progress::during("Deleting the branch…", async {
+                match bucket.delete(bucket.info.revision).await {
+                    // Closed meanwhile, by another run say: gone all the same.
+                    Err(err) if api::answered(&err, "not_found") => Ok(()),
+                    deleted => deleted,
+                }
+            })
+            .await?;
+            eprintln!("{} Deleted {name}", theme::accent().apply_to("✓"));
+            true
+        }
+    };
+    if output == Output::Json {
+        print_json(&json!({ "bucket": name.to_string(), "deleted": deleted }))?;
+    }
+    Ok(())
+}
+
 /// The latest release of `from`, which a new branch starts from, and its files.
 async fn start_from<'a>(target: &'a Target, from: &BucketRef) -> anyhow::Result<Start<'a>> {
     let source = target.bucket(from).await?;
@@ -272,9 +330,9 @@ mod tests {
 
     #[test]
     fn a_branch_is_named_as_a_bucket_is() {
-        assert!(branch_name("pr-123").is_ok());
+        assert_eq!(branch("pr-123").unwrap().to_string(), "branches/pr-123");
         for bad in ["feature/ui", "PR-1", "pr--1", "123", ""] {
-            assert!(branch_name(bad).is_err(), "{bad}");
+            assert!(branch(bad).is_err(), "{bad}");
         }
     }
 
@@ -285,7 +343,7 @@ mod tests {
         Mock::given(method("GET"))
             .and(path(staging))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "data": [{
-                "id": "assets", "name": "Assets", "write_access": "open", "release_count": 2,
+                "id": "assets", "name": "Assets", "write_access": "open", "revision": 1, "entry_count": 0, "release_count": 2,
                 "unreleased_count": 0,
                 "tags": [{ "id": "latest", "release": { "id": "r2", "release_num": 2 },
                     "previous_release": null, "revision": 2,
@@ -333,7 +391,7 @@ mod tests {
         Mock::given(method("GET"))
             .and(path("/storage/v1/apps/app_a/environments/staging/buckets"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "data": [{
-                "id": "assets", "name": "Assets", "write_access": "open", "release_count": 0,
+                "id": "assets", "name": "Assets", "write_access": "open", "revision": 1, "entry_count": 0, "release_count": 0,
                 "unreleased_count": 4, "tags": [],
             }]})))
             .mount(&server)

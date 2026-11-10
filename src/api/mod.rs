@@ -378,6 +378,9 @@ impl fmt::Display for Error {
                     _ => f.write_str("the org's storage is full"),
                 }
             }
+            Some("stale_bucket") => {
+                f.write_str("the bucket changed meanwhile, run the command again")
+            }
             Some("too_many_buckets") => {
                 f.write_str("the environment holds 1,000 buckets, the most it can")
             }

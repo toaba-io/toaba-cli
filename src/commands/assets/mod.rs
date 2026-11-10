@@ -56,6 +56,10 @@ pub enum BranchCommand {
     /// the files that differ are uploaded. Each sync cuts a release, which the
     /// bucket's latest tag follows. Run it again on every push.
     Sync(branch::SyncArgs),
+    /// Delete a branch's bucket, with its files and releases, once it's merged or closed
+    ///
+    /// Asks first, unless --yes is passed. A branch that's already gone is fine.
+    Close(branch::CloseArgs),
 }
 
 #[derive(Subcommand)]
@@ -105,8 +109,9 @@ pub async fn run(command: Command, output: Output) -> anyhow::Result<()> {
         },
         Command::Promote(args) => promote::run(args, output).await,
         Command::Sync(args) => sync::run(args, output).await,
-        Command::Branch {
-            command: BranchCommand::Sync(args),
-        } => branch::sync(args, output).await,
+        Command::Branch { command } => match command {
+            BranchCommand::Sync(args) => branch::sync(args, output).await,
+            BranchCommand::Close(args) => branch::close(args, output).await,
+        },
     }
 }

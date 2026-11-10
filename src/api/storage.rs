@@ -74,6 +74,17 @@ pub struct BucketApi<'a> {
 }
 
 impl BucketApi<'_> {
+    /// Deletes the bucket for good, with its files, releases and tags, if it's still at the
+    /// revision given; otherwise it answers `stale_bucket`.
+    pub async fn delete(&self, revision: u64) -> anyhow::Result<()> {
+        let revision = revision.to_string();
+        let query = [("force", "true"), ("expected_revision", revision.as_str())];
+        self.client
+            .send(reqwest::Method::DELETE, &self.path, &query, None::<&()>)
+            .await?;
+        Ok(())
+    }
+
     /// Every file in the bucket, by path.
     pub async fn entries(&self) -> anyhow::Result<Vec<Entry>> {
         self.every(&format!("{}/entries", self.path), &[("recursive", "true")])
@@ -296,6 +307,9 @@ pub struct Bucket {
     pub name: String,
     /// `open`, or `promotion_only` for a bucket whose files and releases arrive only by promotion.
     pub write_access: String,
+    /// Echoed when deleting the bucket, so a change made meanwhile isn't lost unseen.
+    pub revision: u64,
+    pub entry_count: u64,
     pub release_count: u64,
     /// How many paths differ from the release `latest` points at.
     pub unreleased_count: u64,
@@ -595,6 +609,37 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.downcast_ref::<Error>().unwrap().is("promotion_only"));
+    }
+
+    #[tokio::test]
+    async fn a_bucket_is_deleted_with_its_contents_at_the_revision_read() {
+        let server = MockServer::start().await;
+        let bucket = "/storage/v1/apps/app_a/environments/branches/buckets/pr-1";
+        Mock::given(method("DELETE"))
+            .and(path(bucket))
+            .and(query_param("force", "true"))
+            .and(query_param("expected_revision", "7"))
+            .respond_with(ResponseTemplate::new(204))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("DELETE"))
+            .and(path(bucket))
+            .and(query_param("expected_revision", "6"))
+            .respond_with(ResponseTemplate::new(409).set_body_json(json!({
+                "error": "stale_bucket", "current_bucket": null
+            })))
+            .mount(&server)
+            .await;
+
+        let client = client(&server).await;
+        let pr = client.bucket("app_a", "branches", "pr-1");
+        pr.delete(7).await.unwrap();
+        let stale = pr.delete(6).await.unwrap_err();
+        assert_eq!(
+            stale.to_string(),
+            "the bucket changed meanwhile, run the command again"
+        );
     }
 
     #[tokio::test]

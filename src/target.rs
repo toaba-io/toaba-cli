@@ -459,7 +459,7 @@ mod tests {
         }
 
         fn bucket() -> serde_json::Value {
-            json!({ "id": "pr-1", "name": "pr-1", "write_access": "open", "release_count": 0,
+            json!({ "id": "pr-1", "name": "pr-1", "write_access": "open", "revision": 1, "entry_count": 0, "release_count": 0,
                 "unreleased_count": 0, "tags": [] })
         }
 
