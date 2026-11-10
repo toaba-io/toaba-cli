@@ -89,6 +89,18 @@ pub(super) async fn run(args: Args, output: Output) -> anyhow::Result<()> {
         eprint!("{}", plan_text(&plan, false));
     }
 
+    if let (true, Output::Text, Some(name)) = (dry_run, output, &release_name) {
+        // What the bucket holds unreleased isn't read in a dry run, so this can't say whether
+        // there would be anything to release.
+        match tag_names.as_slice() {
+            [] => println!("Would then release {bucket} as {name}"),
+            tags => println!(
+                "Would then release {bucket} as {name}, and point {} at it",
+                tags.join(", ")
+            ),
+        }
+    }
+
     if applies {
         let question = match &release_name {
             Some(name) if tag_names.is_empty() => {
