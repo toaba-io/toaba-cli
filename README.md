@@ -12,17 +12,17 @@ what each build does.
 On macOS and Linux:
 
 ```sh
-curl --proto '=https' --tlsv1.2 -LsSf https://github.com/Toaba/toaba-cli/releases/latest/download/toaba-cli-installer.sh | sh
+curl --proto '=https' --tlsv1.2 -LsSf https://github.com/toaba-io/toaba-cli/releases/latest/download/toaba-cli-installer.sh | sh
 ```
 
 On Windows, in PowerShell:
 
 ```powershell
-powershell -ExecutionPolicy Bypass -c "irm https://github.com/Toaba/toaba-cli/releases/latest/download/toaba-cli-installer.ps1 | iex"
+powershell -ExecutionPolicy Bypass -c "irm https://github.com/toaba-io/toaba-cli/releases/latest/download/toaba-cli-installer.ps1 | iex"
 ```
 
 Either puts `toaba` in `~/.toaba/bin` and adds it to your `PATH`. The archives, with checksums,
-are on the [releases page](https://github.com/Toaba/toaba-cli/releases). To build from source
+are on the [releases page](https://github.com/toaba-io/toaba-cli/releases). To build from source
 instead, with a Rust toolchain: `cargo install --path .`
 
 ## Log in
@@ -80,7 +80,7 @@ A pipeline doesn't log in. Create a service account and a token for it in the da
 | `TOABA_APP` | The app, by id or name |
 
 ```sh
-curl --proto '=https' --tlsv1.2 -LsSf https://github.com/Toaba/toaba-cli/releases/latest/download/toaba-cli-installer.sh | sh
+curl --proto '=https' --tlsv1.2 -LsSf https://github.com/toaba-io/toaba-cli/releases/latest/download/toaba-cli-installer.sh | sh
 export PATH="$HOME/.toaba/bin:$PATH"    # GitHub Actions needs no export: the installer handles it
 toaba assets sync ./build staging/assets --release "$VERSION" --tag beta --yes
 ```
@@ -123,7 +123,7 @@ env:
   TOABA_TOKEN: ${{ secrets.TOABA_TOKEN }}
   TOABA_APP: ${{ vars.TOABA_APP }}
   BRANCH: pr-${{ github.event.pull_request.number }}
-  INSTALL: https://github.com/Toaba/toaba-cli/releases/latest/download/toaba-cli-installer.sh
+  INSTALL: https://github.com/toaba-io/toaba-cli/releases/latest/download/toaba-cli-installer.sh
 
 # One run at a time per pull request, so two never sync the same bucket at once
 concurrency:

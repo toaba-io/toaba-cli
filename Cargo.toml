@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2024"
 description = "The command-line tool for Toaba, the PaaS for live games"
 license = "Apache-2.0"
-repository = "https://github.com/Toaba/toaba-cli"
+repository = "https://github.com/toaba-io/toaba-cli"
 
 [[bin]]
 name = "toaba"
