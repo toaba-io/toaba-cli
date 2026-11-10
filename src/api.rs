@@ -241,25 +241,86 @@ impl Client {
             .with_context(|| format!("the API's answer to {path} had no summary"))
     }
 
-    /// Cuts a release of the bucket's files as they are now; `latest` moves to it. Sent again, up
-    /// to three times, when no answer arrives: the idempotency key keeps that from cutting two.
+    /// Cuts a release of the bucket's files as they are now; `latest` moves to it.
     pub async fn create_release(
         &self,
         bucket: &str,
         name: &str,
         notes: Option<&str>,
     ) -> anyhow::Result<Release> {
-        let path = format!("{bucket}/releases");
-        let body = serde_json::json!({ "name": name, "notes": notes });
-        let key = idempotency_key(&path);
+        self.post_once(
+            &format!("{bucket}/releases"),
+            &serde_json::json!({ "name": name, "notes": notes }),
+        )
+        .await
+    }
+
+    /// How release `release_id` of `bucket` differs from release `base_id`, which may be in
+    /// another bucket of the app.
+    pub async fn compare_releases(
+        &self,
+        bucket: &str,
+        release_id: &str,
+        base_id: &str,
+    ) -> anyhow::Result<DiffSummary> {
+        let path = format!("{bucket}/releases/{release_id}/compare");
+        let page: DiffPage = self
+            .send(
+                Method::GET,
+                &path,
+                &[("base_release_id", base_id), ("page_size", "1")],
+                None::<&()>,
+            )
+            .await?
+            .json()
+            .await
+            .with_context(|| format!("the API's answer to {path} wasn't what the CLI expects"))?;
+        page.summary
+            .with_context(|| format!("the API's answer to {path} had no summary"))
+    }
+
+    /// Publishes a release of `bucket` in the target bucket: its files become the release's, a
+    /// new release is cut there, and `latest` and the given tags move to it, all or nothing. Each
+    /// tag comes with the revision it was read at, none for a tag to create.
+    pub async fn promote(
+        &self,
+        bucket: &str,
+        release_id: &str,
+        target_environment_id: &str,
+        target_bucket_id: &str,
+        tags: &[(String, Option<u64>)],
+    ) -> anyhow::Result<Release> {
+        let tags: Vec<_> = tags
+            .iter()
+            .map(|(id, revision)| serde_json::json!({ "id": id, "expected_revision": revision }))
+            .collect();
+        self.post_once(
+            &format!("{bucket}/releases/{release_id}/promote"),
+            &serde_json::json!({
+                "target_environment_id": target_environment_id,
+                "target_bucket_id": target_bucket_id,
+                "tags": tags,
+            }),
+        )
+        .await
+    }
+
+    /// `POST path` for something that must happen once, such as cutting a release. Sent again, up
+    /// to three times, when no answer arrives: the idempotency key keeps that from doing it twice.
+    async fn post_once<T: DeserializeOwned>(
+        &self,
+        path: &str,
+        body: &impl Serialize,
+    ) -> anyhow::Result<T> {
+        let key = idempotency_key(path);
         let mut attempt = 1;
         loop {
             let sent = self
-                .send_keyed(Method::POST, &path, &[], Some(&body), Some(&key))
+                .send_keyed(Method::POST, path, &[], Some(body), Some(&key))
                 .await;
             match sent {
                 Ok(response) => {
-                    let answer: Data<Release> = response.json().await.with_context(|| {
+                    let answer: Data<T> = response.json().await.with_context(|| {
                         format!("the API's answer to {path} wasn't what the CLI expects")
                     })?;
                     return Ok(answer.data);
@@ -498,6 +559,9 @@ impl fmt::Display for Error {
                 "the bucket only takes promoted releases, so its files can't be changed directly",
             ),
             Some("stale_tag") => f.write_str("the tag was moved meanwhile, run the command again"),
+            Some("files_changed") => {
+                f.write_str("the target bucket's files changed meanwhile, run the command again")
+            }
             Some("stale_entries") => {
                 f.write_str("the bucket's files changed meanwhile, run the command again")
             }

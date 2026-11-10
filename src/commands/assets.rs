@@ -30,6 +30,27 @@ pub enum Command {
         #[command(subcommand)]
         command: TagCommand,
     },
+    /// Publish a release of one bucket in another, such as staging to production
+    ///
+    /// The target bucket's files become the release's, without copying any bytes;
+    /// a new release is cut there and its `latest` tag moves to it. Unreleased
+    /// changes in the target are discarded.
+    Promote {
+        /// The bucket the release is in, as env/bucket
+        source: BucketRef,
+        /// The release: its number, or a tag of the source bucket, such as latest
+        release: String,
+        /// The bucket to publish it in, as env/bucket
+        target: BucketRef,
+        #[command(flatten)]
+        app: AppArg,
+        /// Point this tag of the target bucket at the new release; repeatable
+        #[arg(long, value_parser = tag_name)]
+        tag: Vec<String>,
+        /// Go ahead without asking; needed where there's nobody to ask, as in CI
+        #[arg(short, long)]
+        yes: bool,
+    },
     /// Make a bucket's files match a local folder
     ///
     /// Uploads the files that are new or changed and removes the ones no longer in
@@ -150,6 +171,14 @@ fn tag_name(text: &str) -> Result<String, String> {
 
 pub async fn run(command: Command, output: Output) -> anyhow::Result<()> {
     match command {
+        Command::Promote {
+            source,
+            release,
+            target,
+            app,
+            tag,
+            yes,
+        } => promote(source, release, target, app, tag, yes, output).await,
         Command::Tag {
             command: TagCommand::List { bucket, app },
         } => list_tags(bucket, app, output).await,
@@ -545,6 +574,179 @@ async fn cut_release(
     Ok(Some(release))
 }
 
+async fn promote(
+    source: BucketRef,
+    release: String,
+    to: BucketRef,
+    arg: AppArg,
+    tags: Vec<String>,
+    yes: bool,
+    output: Output,
+) -> anyhow::Result<()> {
+    if tags.iter().any(|tag| tag == "latest") {
+        bail!("latest follows new releases by itself and can't be set");
+    }
+    if !yes && !prompt::interactive() {
+        bail!("promoting changes the target bucket and its latest tag: pass --yes to go ahead");
+    }
+    // Found before the spinner starts, since finding it may ask which app.
+    let target = target::app(arg).await?;
+    let source_path = api::bucket_path(&target.app_id, &source.environment_id, &source.bucket_id);
+    let to_path = api::bucket_path(&target.app_id, &to.environment_id, &to.bucket_id);
+
+    let line = progress::start("Reading the buckets…");
+    let read = async {
+        source.check(&target).await?;
+        let release_num = match release.trim_start_matches('#').parse::<u64>() {
+            Ok(num) => num,
+            Err(_) => target
+                .client
+                .tags(&source_path)
+                .await?
+                .into_iter()
+                .find(|tag| tag.id == release)
+                .map(|tag| tag.release.release_num)
+                .with_context(|| {
+                    format!("{release} is neither a release number nor a tag of {source}")
+                })?,
+        };
+        let from = target
+            .client
+            .release_by_num(&source_path, release_num)
+            .await
+            .map_err(|err| {
+                // Only the not-found answer is reworded to name the bucket.
+                if err.to_string().starts_with("the bucket has no release") {
+                    anyhow::anyhow!("{source} has no release #{release_num}")
+                } else {
+                    err
+                }
+            })?;
+
+        to.check(&target).await?;
+        let unreleased = target
+            .client
+            .buckets(&target.app_id, &to.environment_id)
+            .await?
+            .into_iter()
+            .find(|bucket| bucket.id == to.bucket_id)
+            .map_or(0, |bucket| bucket.unreleased_count);
+        let to_tags = target.client.tags(&to_path).await?;
+        // Against what the target's players have now: its latest release, if it has one.
+        let current = to_tags.iter().find(|tag| tag.id == "latest");
+        let diff = match current {
+            Some(latest) => Some(
+                target
+                    .client
+                    .compare_releases(&source_path, &from.id, &latest.release.id)
+                    .await?,
+            ),
+            None => None,
+        };
+        anyhow::Ok((from, unreleased, to_tags, diff))
+    }
+    .await;
+    let (from, unreleased, to_tags, diff) =
+        read.inspect_err(|_| progress::failed(&line, "Reading the buckets"))?;
+    line.finish_and_clear();
+
+    let bold = |text: &str| style(text.to_string()).bold().for_stderr();
+    let dim = |text: String| style(text).dim().for_stderr();
+    let from_label = format!("#{} {}", from.release_num, short(&from.name, 60));
+    let same = diff
+        .as_ref()
+        .is_some_and(|diff| diff.added + diff.changed + diff.removed == 0);
+    if same && unreleased == 0 {
+        eprintln!("{to} already has the files of {from_label}: nothing to promote");
+        if !tags.is_empty() {
+            eprintln!(
+                "{}",
+                dim(format!(
+                    "To move a tag there, use `toaba assets tag set <tag> {to} latest`"
+                ))
+            );
+        }
+        return Ok(());
+    }
+
+    eprintln!(
+        "Promote {} from {source} into {}",
+        bold(&from_label),
+        bold(&to.to_string())
+    );
+    match &diff {
+        Some(diff) => eprintln!(
+            "  Against what {to} has now: {} added, {} changed, {} removed, {} unchanged",
+            diff.added, diff.changed, diff.removed, diff.unchanged
+        ),
+        None => eprintln!(
+            "  {to} has no release yet: this is its first, with {} files",
+            from.entry_count
+        ),
+    }
+    if unreleased > 0 {
+        eprintln!(
+            "  {} {to} has {unreleased} unreleased changes, which are discarded",
+            theme::warning().apply_to("!")
+        );
+    }
+    let mut moves = Vec::new();
+    for tag in &tags {
+        let current = to_tags.iter().find(|current| &current.id == tag);
+        match current {
+            Some(current) => eprintln!(
+                "  {tag} moves from #{} to the new release",
+                current.release.release_num
+            ),
+            None => eprintln!("  {tag} is created, pointing at the new release"),
+        }
+        moves.push((tag.clone(), current.map(|current| current.revision)));
+    }
+    eprintln!(
+        "{}",
+        dim(format!(
+            "Game clients of {to} following latest{} get it",
+            if tags.is_empty() {
+                String::new()
+            } else {
+                format!(" or {}", tags.join(", "))
+            }
+        ))
+    );
+    prompt::confirm_or_yes("Promote?", yes)?;
+
+    let line = progress::start("Promoting…");
+    let promoted = target
+        .client
+        .promote(
+            &source_path,
+            &from.id,
+            &to.environment_id,
+            &to.bucket_id,
+            &moves,
+        )
+        .await
+        .inspect_err(|_| progress::failed(&line, "Promoting"))?;
+    progress::finish(
+        &line,
+        format!(
+            "{} Promoted {} to {to} as #{} {}",
+            theme::accent().apply_to("✓"),
+            bold(&from_label),
+            promoted.release_num,
+            dim(format!(
+                "· {} files, {}",
+                promoted.entry_count,
+                HumanBytes(promoted.size_bytes)
+            ))
+        ),
+    );
+    if output == Output::Json {
+        print_json(&promoted)?;
+    }
+    Ok(())
+}
+
 async fn set_tag(
     tag: String,
     bucket: BucketRef,
@@ -732,12 +934,14 @@ async fn list_releases(
     let rows: Vec<[String; 6]> = releases
         .iter()
         .map(|release| {
-            let mut tags: Vec<String> = release.tags.iter().map(|tag| tag.id.clone()).collect();
+            let tags: Vec<String> = release.tags.iter().map(|tag| tag.id.clone()).collect();
+            let mut tags = few(&tags, " ");
             if let Some(from) = &release.promoted_from {
-                tags.push(format!(
+                let from = format!(
                     "(from {}/{} #{})",
                     from.environment_id, from.bucket_id, from.release_num
-                ));
+                );
+                tags = format!("{tags} {from}").trim_start().to_string();
             }
             [
                 format!("#{}", release.release_num),
@@ -745,7 +949,7 @@ async fn list_releases(
                 release.entry_count.to_string(),
                 HumanBytes(release.size_bytes).to_string(),
                 release.create_time.format("%-d %b %Y").to_string(),
-                few(&tags, " "),
+                tags,
             ]
         })
         .collect();
