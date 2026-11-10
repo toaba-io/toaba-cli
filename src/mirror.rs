@@ -455,7 +455,7 @@ async fn put_with_retries(
     let mut attempt = 1;
     loop {
         let sent = Arc::new(AtomicU64::new(0));
-        match put(http, upload, source, size, bar, &sent).await {
+        match put(http, upload, source, size, bar, &sent, STALL).await {
             Ok(()) => return Ok(()),
             Err(err) if attempt == ATTEMPTS => return Err(err),
             Err(_) => {
@@ -477,6 +477,7 @@ async fn put(
     size: u64,
     bar: &ProgressBar,
     sent: &Arc<AtomicU64>,
+    stall: Duration,
 ) -> anyhow::Result<()> {
     let file = tokio::fs::File::open(source)
         .await
@@ -502,12 +503,12 @@ async fn put(
     let response = loop {
         tokio::select! {
             response = &mut response => break response.context("the storage couldn't be reached")?,
-            _ = tokio::time::sleep(Duration::from_secs(5)) => {
+            _ = tokio::time::sleep(stall.min(Duration::from_secs(5))) => {
                 let now = sent.load(Ordering::Relaxed);
                 if now != last.0 {
                     last = (now, Instant::now());
-                } else if last.1.elapsed() >= STALL {
-                    bail!("no bytes moved for {} seconds", STALL.as_secs());
+                } else if last.1.elapsed() >= stall {
+                    bail!("no bytes moved for {} seconds", stall.as_secs());
                 }
             }
         }
@@ -599,6 +600,46 @@ mod tests {
         );
         assert_eq!(too_big(&refused("items.1.path"), &batch), None);
         assert_eq!(too_big(&refused("items.7.size_bytes"), &batch), None);
+    }
+
+    #[tokio::test]
+    async fn an_upload_gives_up_when_no_bytes_move() {
+        // A server that takes the connection and never reads from it: the upload fills the
+        // socket's buffers, then nothing moves.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/object", listener.local_addr().unwrap());
+        let dir = std::env::temp_dir().join(format!("toaba-stall-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let source = dir.join("big.bin");
+        let size = 256 * 1024 * 1024;
+        File::create(&source).unwrap().set_len(size).unwrap();
+
+        let upload = api::Upload {
+            token: "t".into(),
+            url,
+            headers: BTreeMap::new(),
+        };
+        let sent = Arc::new(AtomicU64::new(0));
+        let started = Instant::now();
+        let result = put(
+            &reqwest::Client::new(),
+            &upload,
+            &source,
+            size,
+            &ProgressBar::hidden(),
+            &sent,
+            Duration::from_secs(1),
+        )
+        .await;
+
+        assert_eq!(
+            result.unwrap_err().to_string(),
+            "no bytes moved for 1 seconds"
+        );
+        assert!(started.elapsed() < Duration::from_secs(20));
+        assert!(sent.load(Ordering::Relaxed) < size);
+        drop(listener);
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

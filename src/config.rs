@@ -204,7 +204,46 @@ pub fn lock() -> anyhow::Result<fs::File> {
     }
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Where a test keeps its config, so tests never touch the real one or each other's.
+    static TEST_DIR: std::cell::RefCell<Option<PathBuf>> = const { std::cell::RefCell::new(None) };
+}
+
+/// A test's own config folder, removed when the test ends.
+#[cfg(test)]
+pub struct TestDir(PathBuf);
+
+#[cfg(test)]
+impl Drop for TestDir {
+    fn drop(&mut self) {
+        TEST_DIR.with(|test_dir| *test_dir.borrow_mut() = None);
+        let _ = fs::remove_dir_all(&self.0);
+    }
+}
+
+/// Points this test's thread at a config folder of its own, which starts empty, for as long as the
+/// returned value lives.
+#[cfg(test)]
+#[must_use]
+pub fn use_test_dir() -> TestDir {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    static NEXT: AtomicUsize = AtomicUsize::new(0);
+    let dir = std::env::temp_dir().join(format!(
+        "toaba-test-{}-{}",
+        std::process::id(),
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    ));
+    let _ = fs::remove_dir_all(&dir);
+    TEST_DIR.with(|test_dir| *test_dir.borrow_mut() = Some(dir.clone()));
+    TestDir(dir)
+}
+
 fn dir() -> anyhow::Result<PathBuf> {
+    #[cfg(test)]
+    if let Some(dir) = TEST_DIR.with(|test_dir| test_dir.borrow().clone()) {
+        return Ok(dir);
+    }
     let base = match std::env::var_os("XDG_CONFIG_HOME").filter(|dir| !dir.is_empty()) {
         Some(dir) => PathBuf::from(dir),
         None if cfg!(windows) => {
@@ -285,6 +324,105 @@ mod tests {
             "{shared}"
         );
         assert!(pick(logins(), "Nope").is_err());
+    }
+
+    fn login_with_apps(org_name: &str, apps: &[(&str, &str)]) -> Login {
+        Login {
+            apps: apps
+                .iter()
+                .map(|(id, name)| (id.to_string(), name.to_string()))
+                .collect(),
+            ..login(org_name)
+        }
+    }
+
+    fn some_tokens(access_token: &str) -> Tokens {
+        Tokens {
+            access_token: access_token.into(),
+            refresh_token: "toaba_ort_a".into(),
+            expire_time: Utc::now(),
+        }
+    }
+
+    #[test]
+    fn the_first_login_to_an_org_with_one_app_puts_that_app_in_use() {
+        let _dir = use_test_dir();
+        assert!(logins().unwrap().is_empty());
+        assert_eq!(app().unwrap(), None);
+
+        let two_apps = login_with_apps("Studio", &[("app_1", "Game"), ("app_2", "Tools")]);
+        assert_eq!(
+            save_login("org_s", two_apps, some_tokens("s")).unwrap(),
+            None
+        );
+        assert_eq!(app().unwrap(), None);
+
+        let one_app = login_with_apps("Solo", &[("app_3", "Puzzle")]);
+        let chosen = save_login("org_o", one_app, some_tokens("o")).unwrap();
+        assert_eq!(chosen.as_deref(), Some("app_3"));
+        assert_eq!(app().unwrap().as_deref(), Some("app_3"));
+
+        // An app is already in use, so another single-app org doesn't take over.
+        let another = login_with_apps("Other", &[("app_4", "Racer")]);
+        assert_eq!(
+            save_login("org_x", another, some_tokens("x")).unwrap(),
+            None
+        );
+        assert_eq!(app().unwrap().as_deref(), Some("app_3"));
+        assert_eq!(logins().unwrap().len(), 3);
+    }
+
+    #[test]
+    fn logging_in_again_replaces_the_login_and_its_tokens() {
+        let _dir = use_test_dir();
+        save_login("org_a", login("Old name"), some_tokens("first")).unwrap();
+        save_login("org_a", login("New name"), some_tokens("second")).unwrap();
+
+        let logins = logins().unwrap();
+        assert_eq!(logins.len(), 1);
+        assert_eq!(logins["org_a"].org_name, "New name");
+        assert_eq!(tokens("org_a").unwrap().unwrap().access_token, "second");
+    }
+
+    #[test]
+    fn removing_a_login_drops_its_tokens_and_its_app_in_use_only() {
+        let _dir = use_test_dir();
+        let solo = login_with_apps("Solo", &[("app_3", "Puzzle")]);
+        save_login("org_o", solo, some_tokens("o")).unwrap();
+        save_login("org_s", login("Studio"), some_tokens("s")).unwrap();
+
+        remove("org_s").unwrap();
+        assert!(tokens("org_s").unwrap().is_none());
+        assert_eq!(app().unwrap().as_deref(), Some("app_3"));
+
+        remove("org_o").unwrap();
+        assert!(logins().unwrap().is_empty());
+        assert!(tokens("org_o").unwrap().is_none());
+        assert_eq!(app().unwrap(), None);
+    }
+
+    #[test]
+    fn a_login_s_apps_are_replaced_and_the_app_in_use_can_change() {
+        let _dir = use_test_dir();
+        save_login(
+            "org_a",
+            login_with_apps("Acme", &[("app_1", "Game")]),
+            some_tokens("a"),
+        )
+        .unwrap();
+
+        set_apps(
+            "org_a",
+            BTreeMap::from([("app_2".to_string(), "Sequel".to_string())]),
+        )
+        .unwrap();
+        let apps = &logins().unwrap()["org_a"].apps;
+        assert_eq!(apps.len(), 1);
+        assert_eq!(apps["app_2"], "Sequel");
+
+        use_app("app_2").unwrap();
+        assert_eq!(app().unwrap().as_deref(), Some("app_2"));
+        assert_eq!(find_login("acme").unwrap().0, "org_a");
     }
 
     #[test]
