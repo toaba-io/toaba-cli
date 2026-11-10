@@ -140,3 +140,8 @@ outside the project can't write to your buckets.
 The CLI keeps its state in `~/.config/toaba` (`$XDG_CONFIG_HOME/toaba`, or `%APPDATA%\toaba` on
 Windows): `config.toml` holds your logins and the app in use, and `credentials.toml`, readable
 only by you, holds their tokens. `toaba logout` ends a login on Toaba and removes it from both.
+
+## License
+
+Apache-2.0, see [LICENSE](LICENSE). The license covers this CLI only; it grants no right to use
+the Toaba name or logo.
