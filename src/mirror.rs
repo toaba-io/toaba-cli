@@ -1,4 +1,4 @@
-//! `toaba assets sync`: what it works out before changing anything (the files of a local folder,
+//! Mirroring a folder into a bucket, for `toaba assets sync`: what it works out before changing anything (the files of a local folder,
 //! and how they differ from a bucket's), then making the bucket match. A file has changed when its
 //! SHA-256 or its content type has.
 

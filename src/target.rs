@@ -54,27 +54,6 @@ impl std::fmt::Display for Bucket<'_> {
     }
 }
 
-impl Bucket<'_> {
-    /// A release named as people name one: by its number, or by a tag of the bucket pointing at it.
-    pub async fn release(&self, release: &str) -> anyhow::Result<api::Release> {
-        let release_num = match release.trim_start_matches('#').parse::<u64>() {
-            Ok(num) => num,
-            Err(_) => self
-                .tags()
-                .await?
-                .into_iter()
-                .find(|tag| tag.id == release)
-                .map(|tag| tag.release.release_num)
-                .with_context(|| {
-                    format!("{release} is neither a release number nor a tag of {self}")
-                })?,
-        };
-        self.release_by_num(release_num)
-            .await?
-            .with_context(|| format!("{self} has no release #{release_num}"))
-    }
-}
-
 impl Target {
     /// The app's bucket. Fails when the app has none by that name, naming the ones it has.
     pub async fn bucket(&self, name: &BucketRef) -> anyhow::Result<Bucket<'_>> {
@@ -340,21 +319,9 @@ impl std::fmt::Display for BucketRef {
     }
 }
 
-/// A tag to set, as a command's argument: an id people choose, and not `latest`, which follows new
-/// releases by itself.
-pub fn tag_name(text: &str) -> Result<String, String> {
-    if text == "latest" {
-        Err("latest follows new releases by itself and can't be set".to_string())
-    } else if is_slug(text) {
-        Ok(text.to_string())
-    } else {
-        Err("a tag is lowercase letters, digits and hyphens, starting with a letter".to_string())
-    }
-}
-
 /// An id people choose: a lowercase letter, then lowercase letters and digits in parts joined by
 /// single hyphens, 63 characters at most.
-fn is_slug(text: &str) -> bool {
+pub fn is_slug(text: &str) -> bool {
     text.len() <= 63
         && text.starts_with(|first: char| first.is_ascii_lowercase())
         && text.split('-').all(|part| {

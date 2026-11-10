@@ -65,6 +65,11 @@ pub fn short(text: &str, max: usize) -> String {
     console::truncate_str(text, max, "…").into_owned()
 }
 
+/// A date as tables show it, such as `9 Nov 2026`.
+pub fn date(time: &chrono::DateTime<chrono::Utc>) -> String {
+    time.format("%-d %b %Y").to_string()
+}
+
 /// The first three of `items`, then how many more there are.
 pub fn few(items: &[String], separator: &str) -> String {
     match items.len() {

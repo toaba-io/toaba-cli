@@ -2,11 +2,11 @@ mod api;
 mod auth;
 mod commands;
 mod config;
+mod mirror;
 mod oauth;
 mod output;
 mod progress;
 mod prompt;
-mod sync;
 mod target;
 mod theme;
 
