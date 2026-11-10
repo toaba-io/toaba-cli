@@ -1,0 +1,18 @@
+# For THIRD-PARTY-NOTICES.md, which ships with every release. After changing dependencies:
+#   cargo about generate --config about.toml about.hbs -o THIRD-PARTY-NOTICES.md
+
+# The licenses dependencies may use, in order of preference where a crate offers a choice.
+accepted = ["Apache-2.0", "MIT", "BSD-3-Clause", "ISC", "Unicode-3.0", "CDLA-Permissive-2.0"]
+
+# The platforms releases are built for, so platform-only dependencies are listed too.
+targets = [
+    "aarch64-apple-darwin",
+    "x86_64-apple-darwin",
+    "x86_64-pc-windows-msvc",
+    "aarch64-unknown-linux-musl",
+    "x86_64-unknown-linux-musl",
+]
+
+# Only what ends up in the binary.
+ignore-build-dependencies = true
+ignore-dev-dependencies = true
