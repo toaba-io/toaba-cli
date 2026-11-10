@@ -7,13 +7,23 @@ promote it from staging to production.
 Setting things up (apps, environments, buckets, keys) is done in the dashboard. The CLI covers
 what each build does.
 
-## Build
+## Install
 
-There are no release binaries yet. With a Rust toolchain:
+On macOS and Linux:
 
 ```sh
-cargo install --path .
+curl --proto '=https' --tlsv1.2 -LsSf https://github.com/Toaba/toaba-cli/releases/latest/download/toaba-cli-installer.sh | sh
 ```
+
+On Windows, in PowerShell:
+
+```powershell
+powershell -ExecutionPolicy Bypass -c "irm https://github.com/Toaba/toaba-cli/releases/latest/download/toaba-cli-installer.ps1 | iex"
+```
+
+Either puts `toaba` in `~/.toaba/bin` and adds it to your `PATH`. The archives, with checksums,
+are on the [releases page](https://github.com/Toaba/toaba-cli/releases). To build from source
+instead, with a Rust toolchain: `cargo install --path .`
 
 ## Log in
 
@@ -70,6 +80,8 @@ A pipeline doesn't log in. Create a service account and a token for it in the da
 | `TOABA_APP` | The app, by id or name |
 
 ```sh
+curl --proto '=https' --tlsv1.2 -LsSf https://github.com/Toaba/toaba-cli/releases/latest/download/toaba-cli-installer.sh | sh
+export PATH="$HOME/.toaba/bin:$PATH"    # GitHub Actions needs no export: the installer handles it
 toaba assets sync ./build staging/assets --release "$VERSION" --tag beta --yes
 ```
 
@@ -100,7 +112,7 @@ A git branch's name can be the branch too: it becomes an id, so `feature/New-UI`
 punctuation, such as `feature/new-ui` and `feature-new-ui`, share a bucket; pull request numbers
 never do.
 
-In GitHub Actions, with `toaba` installed on the runner:
+In GitHub Actions:
 
 ```yaml
 on:
@@ -111,6 +123,7 @@ env:
   TOABA_TOKEN: ${{ secrets.TOABA_TOKEN }}
   TOABA_APP: ${{ vars.TOABA_APP }}
   BRANCH: pr-${{ github.event.pull_request.number }}
+  INSTALL: https://github.com/Toaba/toaba-cli/releases/latest/download/toaba-cli-installer.sh
 
 # One run at a time per pull request, so two never sync the same bucket at once
 concurrency:
@@ -121,14 +134,16 @@ jobs:
     if: github.event.action != 'closed'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - run: ./build-content.sh    # your build, writing ./build
+      - run: curl --proto '=https' --tlsv1.2 -LsSf "$INSTALL" | sh
       - run: toaba assets branch sync ./build "$BRANCH" --from staging/assets --yes
 
   close:
     if: github.event.action == 'closed'
     runs-on: ubuntu-latest
     steps:
+      - run: curl --proto '=https' --tlsv1.2 -LsSf "$INSTALL" | sh
       - run: toaba assets branch close "$BRANCH" --yes
 ```
 
