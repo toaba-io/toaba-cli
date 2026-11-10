@@ -11,7 +11,7 @@ use serde_json::json;
 use super::release::{CutRelease, cut_release, release_label, release_size};
 use super::sync::{FolderArgs, hash, show_plan, upload, with_plan};
 use super::tag::LATEST;
-use crate::output::{Output, date, print_json, table};
+use crate::output::{Output, ago, print_json, table};
 use crate::prompt::YesArg;
 use crate::target::{self, AppArg, Bucket, BucketRef, Target};
 use crate::{api, mirror, progress, theme};
@@ -301,7 +301,7 @@ pub(super) async fn list(args: ListArgs, output: Output) -> anyhow::Result<()> {
                     .map(|tag| format!("#{}", tag.release.release_num))
                     .unwrap_or_default(),
                 bucket.entry_count.to_string(),
-                latest.map(|tag| date(&tag.update_time)).unwrap_or_default(),
+                latest.map(|tag| ago(&tag.update_time)).unwrap_or_default(),
             ]
         })
         .collect();

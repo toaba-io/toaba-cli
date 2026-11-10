@@ -3,6 +3,7 @@
 
 use std::sync::atomic::AtomicBool;
 
+use chrono::{DateTime, Utc};
 use serde::Serialize;
 
 /// Set while a command has cleaning up to do on Ctrl+C, which it then handles itself. Otherwise
@@ -65,9 +66,42 @@ pub fn short(text: &str, max: usize) -> String {
     console::truncate_str(text, max, "…").into_owned()
 }
 
-/// A date as tables show it, such as `9 Nov 2026`.
-pub fn date(time: &chrono::DateTime<chrono::Utc>) -> String {
-    time.format("%-d %b %Y").to_string()
+/// A day in the local time zone, such as `9 Nov 2026`.
+pub fn date(time: &DateTime<Utc>) -> String {
+    time.with_timezone(&chrono::Local)
+        .format("%-d %b %Y")
+        .to_string()
+}
+
+/// How long ago `time` was, such as `3 hours ago`, as glab's lists show times: it reads the same
+/// in any time zone. JSON keeps the exact time.
+pub fn ago(time: &DateTime<Utc>) -> String {
+    ago_from(time, &Utc::now())
+}
+
+fn ago_from(time: &DateTime<Utc>, now: &DateTime<Utc>) -> String {
+    const MINUTE: i64 = 60;
+    const HOUR: i64 = 60 * MINUTE;
+    const DAY: i64 = 24 * HOUR;
+    const MONTH: i64 = 30 * DAY;
+    const YEAR: i64 = 365 * DAY;
+    let seconds = (*now - *time).num_seconds();
+    let (count, unit) = if seconds < MINUTE {
+        // A clock a little ahead of the server's makes a moment ago look like the future.
+        return "just now".to_string();
+    } else if seconds < HOUR {
+        (seconds / MINUTE, "minute")
+    } else if seconds < DAY {
+        (seconds / HOUR, "hour")
+    } else if seconds < MONTH {
+        (seconds / DAY, "day")
+    } else if seconds < YEAR {
+        (seconds / MONTH, "month")
+    } else {
+        (seconds / YEAR, "year")
+    };
+    let plural = if count == 1 { "" } else { "s" };
+    format!("{count} {unit}{plural} ago")
 }
 
 /// The first three of `items`, then how many more there are.
@@ -115,6 +149,19 @@ mod tests {
         let tags: Vec<String> = (1..=5).map(|n| format!("t{n}")).collect();
         assert_eq!(few(&tags, ", "), "t1, t2, t3, +2 more");
         assert_eq!(few(&tags[..3], ", "), "t1, t2, t3");
+    }
+
+    #[test]
+    fn times_read_as_how_long_ago_in_the_largest_whole_unit() {
+        let now: DateTime<Utc> = "2026-11-10T12:00:00Z".parse().unwrap();
+        let ago = |time: &str| ago_from(&time.parse().unwrap(), &now);
+        assert_eq!(ago("2026-11-10T12:00:05Z"), "just now");
+        assert_eq!(ago("2026-11-10T11:59:30Z"), "just now");
+        assert_eq!(ago("2026-11-10T11:59:00Z"), "1 minute ago");
+        assert_eq!(ago("2026-11-10T09:30:00Z"), "2 hours ago");
+        assert_eq!(ago("2026-11-09T11:00:00Z"), "1 day ago");
+        assert_eq!(ago("2026-10-01T12:00:00Z"), "1 month ago");
+        assert_eq!(ago("2024-11-01T12:00:00Z"), "2 years ago");
     }
 
     #[test]

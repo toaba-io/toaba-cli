@@ -8,7 +8,7 @@ use console::style;
 use serde_json::json;
 
 use crate::api::App;
-use crate::output::{Output, date, pad, print_json, sentence, table, width};
+use crate::output::{Output, ago, date, pad, print_json, sentence, table, width};
 use crate::target::{self, AppArg};
 use crate::{auth, config, progress, prompt, theme};
 
@@ -199,7 +199,7 @@ async fn keys(arg: AppArg, env: bool, output: Output) -> anyhow::Result<()> {
     }
     let rows: Vec<[String; 2]> = keys
         .iter()
-        .map(|key| [key.key.clone(), date(&key.create_time)])
+        .map(|key| [key.key.clone(), ago(&key.create_time)])
         .collect();
     table(["KEY", "CREATED"], &rows);
     Ok(())
@@ -210,6 +210,6 @@ fn deletion(app: &App) -> Option<String> {
     let expire_time = app.expire_time?;
     Some(format!(
         "scheduled for deletion, gone on {}",
-        expire_time.format("%-d %b %Y")
+        date(&expire_time)
     ))
 }

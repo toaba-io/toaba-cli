@@ -5,7 +5,7 @@ use console::style;
 use serde_json::json;
 
 use super::release::{find_release, release_label};
-use crate::output::{Output, date, print_json, table};
+use crate::output::{Output, ago, print_json, table};
 use crate::prompt::YesArg;
 use crate::target::{self, AppArg, Bucket, BucketRef};
 use crate::{api, progress, theme};
@@ -73,7 +73,7 @@ pub(super) async fn list(args: ListArgs, output: Output) -> anyhow::Result<()> {
                     .as_ref()
                     .map(|release| format!("#{}", release.release_num))
                     .unwrap_or_default(),
-                date(&tag.update_time),
+                ago(&tag.update_time),
             ]
         })
         .collect();

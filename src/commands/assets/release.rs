@@ -5,7 +5,7 @@ use console::style;
 use indicatif::HumanBytes;
 use serde_json::json;
 
-use crate::output::{Output, date, few, print_json, short, table};
+use crate::output::{Output, ago, few, print_json, short, table};
 use crate::prompt::{self, YesArg};
 use crate::target::{self, AppArg, Bucket, BucketRef};
 use crate::{api, progress, theme};
@@ -101,7 +101,7 @@ pub(super) async fn list(args: ListArgs, output: Output) -> anyhow::Result<()> {
                 short(&release.name, 40),
                 release.entry_count.to_string(),
                 HumanBytes(release.size_bytes).to_string(),
-                date(&release.create_time),
+                ago(&release.create_time),
                 tags,
             ]
         })
