@@ -48,6 +48,20 @@ impl<'a> std::ops::Deref for Bucket<'a> {
     }
 }
 
+impl Bucket<'_> {
+    /// Fails for a bucket that only takes promoted releases, which `doing` (uploading files, say)
+    /// can't change, before any work is done on it.
+    pub fn require_open(&self, doing: &str) -> anyhow::Result<()> {
+        if self.info.write_access == "promotion_only" {
+            bail!(
+                "{self} only takes promoted releases, so {doing} there isn't possible: \
+                 use `toaba assets promote`"
+            );
+        }
+        Ok(())
+    }
+}
+
 impl std::fmt::Display for Bucket<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         self.name.fmt(f)

@@ -65,6 +65,7 @@ pub(super) async fn run(args: Args, output: Output) -> anyhow::Result<()> {
     let target = target::app(arg).await?;
     let (bucket, remote) = progress::during("Reading the bucket…", async {
         let bucket = target.bucket(&bucket).await?;
+        bucket.require_open("syncing files")?;
         let remote = bucket.entries().await?;
         Ok((bucket, remote))
     })

@@ -127,7 +127,12 @@ pub(super) async fn create(args: CreateArgs, output: Output) -> anyhow::Result<(
     yes.require("cutting a release moves the bucket's latest tag: pass --yes to go ahead")?;
     // Found before the spinner starts, since finding it may ask which app.
     let target = target::app(arg).await?;
-    let bucket = progress::during("Reading the bucket…", target.bucket(&bucket)).await?;
+    let bucket = progress::during("Reading the bucket…", async {
+        let bucket = target.bucket(&bucket).await?;
+        bucket.require_open("cutting a release")?;
+        Ok(bucket)
+    })
+    .await?;
 
     let cut = CutRelease {
         name: &name,
