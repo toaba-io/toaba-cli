@@ -92,8 +92,13 @@ toaba assets branch close pr-123 --yes    # once the pull request is merged or c
 
 The first sync creates the `branches` environment and the bucket. With `--from`, a new branch
 starts from that bucket's latest release, so only the files that differ are uploaded; later syncs
-ignore it, so a pipeline can run the same command every time. A branch is named with lowercase
-letters, digits and hyphens, such as `pr-123`. The token needs write access to the app's storage.
+ignore it, so a pipeline can run the same command every time. The token needs write access to the
+app's storage.
+
+A git branch's name can be the branch too: it becomes an id, so `feature/New-UI` is
+`branches/feature-new-ui`, and `close` takes the same name. Names that differ only in case or
+punctuation, such as `feature/new-ui` and `feature-new-ui`, share a bucket; pull request numbers
+never do.
 
 In GitHub Actions, with `toaba` installed on the runner:
 

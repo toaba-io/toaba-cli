@@ -20,17 +20,18 @@ use crate::{api, mirror, progress, theme};
 const ENVIRONMENT: &str = "branches";
 const ENVIRONMENT_NAME: &str = "Branches";
 
-/// A branch's name, as a command's argument: the bucket it names.
+/// A branch's name, as a command's argument: the bucket it names. A git branch's name becomes an
+/// id the way preview URLs are made from branches, so `feature/New-UI` is `feature-new-ui`.
 fn branch(text: &str) -> Result<BucketRef, String> {
-    if target::is_slug(text) {
+    let id = slug::slugify(text);
+    if target::is_slug(&id) {
         Ok(BucketRef {
             environment_id: ENVIRONMENT.to_string(),
-            bucket_id: text.to_string(),
+            bucket_id: id,
         })
     } else {
         Err(
-            "a branch is lowercase letters, digits and hyphens, starting with a letter, \
-             such as pr-123"
+            "a branch must start with a letter and be at most 63 characters, such as pr-123"
                 .to_string(),
         )
     }
@@ -40,7 +41,8 @@ fn branch(text: &str) -> Result<BucketRef, String> {
 pub struct SyncArgs {
     /// The local folder
     dir: PathBuf,
-    /// The branch, such as pr-123: its bucket is branches/<branch>
+    /// The branch, such as pr-123, or a git branch made an id, feature/New-UI becoming
+    /// feature-new-ui: its bucket is branches/<branch>
     #[arg(value_parser = branch)]
     branch: BucketRef,
     /// Start a new branch from this bucket's latest release, as env/bucket, so only the files that
@@ -66,7 +68,7 @@ pub struct ListArgs {
 
 #[derive(clap::Args)]
 pub struct CloseArgs {
-    /// The branch, such as pr-123
+    /// The branch, as `branch sync` was given it, such as pr-123 or feature/New-UI
     #[arg(value_parser = branch)]
     branch: BucketRef,
     #[command(flatten)]
@@ -338,10 +340,10 @@ pub(super) async fn close(args: CloseArgs, output: Output) -> anyhow::Result<()>
         }
         Some(bucket) => {
             eprintln!(
-                "Delete {} for good: {} files, {} releases",
+                "Delete {} for good: {}, {}",
                 style(&name).bold().for_stderr(),
-                bucket.info.entry_count,
-                bucket.info.release_count
+                count(bucket.info.entry_count, "file"),
+                count(bucket.info.release_count, "release")
             );
             eprintln!(
                 "{}",
@@ -366,6 +368,11 @@ pub(super) async fn close(args: CloseArgs, output: Output) -> anyhow::Result<()>
         print_json(&json!({ "bucket": name.to_string(), "deleted": deleted }))?;
     }
     Ok(())
+}
+
+/// `1 file`, `3 files`.
+fn count(n: u64, what: &str) -> String {
+    format!("{n} {what}{}", if n == 1 { "" } else { "s" })
 }
 
 /// The latest release of `from`, which a new branch starts from, and its files.
@@ -400,9 +407,15 @@ mod tests {
     use super::*;
 
     #[test]
-    fn a_branch_is_named_as_a_bucket_is() {
+    fn a_git_branch_s_name_becomes_its_bucket_s_id() {
+        let id = |name: &str| branch(name).unwrap().bucket_id;
         assert_eq!(branch("pr-123").unwrap().to_string(), "branches/pr-123");
-        for bad in ["feature/ui", "PR-1", "pr--1", "123", ""] {
+        assert_eq!(id("feature/New-UI"), "feature-new-ui");
+        assert_eq!(id("fix_login--again"), "fix-login-again");
+        assert_eq!(id("release/1.4"), "release-1-4");
+        assert_eq!(id("feature/夏-event"), "feature-xia-event");
+        let long = format!("a{}", "b".repeat(63));
+        for bad in ["123-hotfix", "", "///", long.as_str()] {
             assert!(branch(bad).is_err(), "{bad}");
         }
     }
