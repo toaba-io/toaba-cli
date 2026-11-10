@@ -80,28 +80,12 @@ pub fn ago(time: &DateTime<Utc>) -> String {
 }
 
 fn ago_from(time: &DateTime<Utc>, now: &DateTime<Utc>) -> String {
-    const MINUTE: i64 = 60;
-    const HOUR: i64 = 60 * MINUTE;
-    const DAY: i64 = 24 * HOUR;
-    const MONTH: i64 = 30 * DAY;
-    const YEAR: i64 = 365 * DAY;
-    let seconds = (*now - *time).num_seconds();
-    let (count, unit) = if seconds < MINUTE {
-        // A clock a little ahead of the server's makes a moment ago look like the future.
-        return "just now".to_string();
-    } else if seconds < HOUR {
-        (seconds / MINUTE, "minute")
-    } else if seconds < DAY {
-        (seconds / HOUR, "hour")
-    } else if seconds < MONTH {
-        (seconds / DAY, "day")
-    } else if seconds < YEAR {
-        (seconds / MONTH, "month")
-    } else {
-        (seconds / YEAR, "year")
-    };
-    let plural = if count == 1 { "" } else { "s" };
-    format!("{count} {unit}{plural} ago")
+    // A clock a little ahead of the server's makes a moment ago look like the future.
+    let elapsed = (*now - *time).to_std().unwrap_or_default();
+    timeago::Formatter::new()
+        .min_unit(timeago::TimeUnit::Minutes)
+        .too_low("just now")
+        .convert(elapsed)
 }
 
 /// The first three of `items`, then how many more there are.
@@ -160,6 +144,7 @@ mod tests {
         assert_eq!(ago("2026-11-10T11:59:00Z"), "1 minute ago");
         assert_eq!(ago("2026-11-10T09:30:00Z"), "2 hours ago");
         assert_eq!(ago("2026-11-09T11:00:00Z"), "1 day ago");
+        assert_eq!(ago("2026-10-27T12:00:00Z"), "2 weeks ago");
         assert_eq!(ago("2026-10-01T12:00:00Z"), "1 month ago");
         assert_eq!(ago("2024-11-01T12:00:00Z"), "2 years ago");
     }
