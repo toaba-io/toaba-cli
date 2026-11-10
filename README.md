@@ -77,6 +77,59 @@ Without a terminal, a command that would ask a question fails unless it gets `--
 `-o json` to any command for output a script can read: results go to stdout, messages to stderr,
 and a failure prints `{"error": "…"}` with a non-zero exit code.
 
+## A bucket per pull request
+
+`toaba assets branch` gives each branch or pull request its own bucket, `branches/<branch>`, so
+its content can be tried before it's merged: point a game build at that bucket's `latest` tag.
+
+```sh
+# On every push: make the bucket match the folder, and release it
+toaba assets branch sync ./build pr-123 --from staging/assets --yes
+
+toaba assets branch list                  # the branches, most recently released first
+toaba assets branch close pr-123 --yes    # once the pull request is merged or closed
+```
+
+The first sync creates the `branches` environment and the bucket. With `--from`, a new branch
+starts from that bucket's latest release, so only the files that differ are uploaded; later syncs
+ignore it, so a pipeline can run the same command every time. A branch is named with lowercase
+letters, digits and hyphens, such as `pr-123`. The token needs write access to the app's storage.
+
+In GitHub Actions, with `toaba` installed on the runner:
+
+```yaml
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, closed]
+
+env:
+  TOABA_TOKEN: ${{ secrets.TOABA_TOKEN }}
+  TOABA_APP: ${{ vars.TOABA_APP }}
+  BRANCH: pr-${{ github.event.pull_request.number }}
+
+# One run at a time per pull request, so two never sync the same bucket at once
+concurrency:
+  group: toaba-${{ github.event.pull_request.number }}
+
+jobs:
+  sync:
+    if: github.event.action != 'closed'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: ./build-content.sh    # your build, writing ./build
+      - run: toaba assets branch sync ./build "$BRANCH" --from staging/assets --yes
+
+  close:
+    if: github.event.action == 'closed'
+    runs-on: ubuntu-latest
+    steps:
+      - run: toaba assets branch close "$BRANCH" --yes
+```
+
+Pull requests from forks don't get the repository's secrets, so these jobs fail for them: someone
+outside the project can't write to your buckets.
+
 ## Files
 
 The CLI keeps its state in `~/.config/toaba` (`$XDG_CONFIG_HOME/toaba`, or `%APPDATA%\toaba` on
