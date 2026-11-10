@@ -162,7 +162,7 @@ pub async fn pick(report: bool) -> anyhow::Result<Reached> {
     let width = output::width("", apps.iter().map(|app| &app.app_name));
     let labels: Vec<String> = apps
         .iter()
-        .map(|app| format!("{:<width$}  {}", app.app_name, app.org_name))
+        .map(|app| format!("{}  {}", output::pad(&app.app_name, width), app.org_name))
         .collect();
     let in_use = config::app()?;
     let start = apps

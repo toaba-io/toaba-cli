@@ -42,12 +42,34 @@ impl std::fmt::Display for Reported {
 
 impl std::error::Error for Reported {}
 
-/// The widest of `header` and `values`, in characters, to line up a column.
+/// The widest of `header` and `values`, in terminal cells, to line up a column. An emoji or a CJK
+/// character takes two cells, so widths are measured as displayed, not by counting characters.
 pub fn width<S: AsRef<str>>(header: &str, values: impl IntoIterator<Item = S>) -> usize {
     values
         .into_iter()
-        .map(|value| value.as_ref().chars().count())
-        .chain([header.chars().count()])
+        .map(|value| console::measure_text_width(value.as_ref()))
+        .chain([console::measure_text_width(header)])
         .max()
         .unwrap_or(0)
+}
+
+/// `text` with spaces after it up to `width` terminal cells.
+pub fn pad(text: &str, width: usize) -> String {
+    let missing = width.saturating_sub(console::measure_text_width(text));
+    format!("{text}{}", " ".repeat(missing))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn columns_line_up_by_displayed_width() {
+        let names = ["Beta", "夏イベント", "Summer 🎉"];
+        let widest = width("NAME", names);
+        assert_eq!(widest, 10);
+        for name in names {
+            assert_eq!(console::measure_text_width(&pad(name, widest)), 10);
+        }
+    }
 }

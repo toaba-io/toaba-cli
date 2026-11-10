@@ -14,6 +14,7 @@ use reqwest::header::{ACCEPT, RETRY_AFTER};
 use reqwest::{Method, Response, StatusCode};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 /// The CLI's OAuth client id, which Toaba knows.
 pub const CLIENT_ID: &str = "toaba-cli";
@@ -160,6 +161,68 @@ impl Client {
         }
     }
 
+    /// The bucket's newest releases, `limit` at most (up to 1,000), and whether there are more.
+    pub async fn releases(&self, bucket: &str, limit: u16) -> anyhow::Result<(Vec<Release>, bool)> {
+        let path = format!("{bucket}/releases");
+        let page: ReleasePage = self
+            .send(
+                Method::GET,
+                &path,
+                &[("page_size", &limit.to_string())],
+                None::<&()>,
+            )
+            .await?
+            .json()
+            .await
+            .with_context(|| format!("the API's answer to {path} wasn't what the CLI expects"))?;
+        Ok((page.data, page.next_page_token.is_some()))
+    }
+
+    /// How the bucket's files differ from its latest release: everything is added before the first.
+    pub async fn unreleased(&self, bucket: &str) -> anyhow::Result<DiffSummary> {
+        let path = format!("{bucket}/compare");
+        let page: DiffPage = self
+            .send(Method::GET, &path, &[("page_size", "1")], None::<&()>)
+            .await?
+            .json()
+            .await
+            .with_context(|| format!("the API's answer to {path} wasn't what the CLI expects"))?;
+        page.summary
+            .with_context(|| format!("the API's answer to {path} had no summary"))
+    }
+
+    /// Cuts a release of the bucket's files as they are now; `latest` moves to it. Sent again, up
+    /// to three times, when no answer arrives: the idempotency key keeps that from cutting two.
+    pub async fn create_release(
+        &self,
+        bucket: &str,
+        name: &str,
+        notes: Option<&str>,
+    ) -> anyhow::Result<Release> {
+        let path = format!("{bucket}/releases");
+        let body = serde_json::json!({ "name": name, "notes": notes });
+        let key = idempotency_key(&path);
+        let mut attempt = 1;
+        loop {
+            let sent = self
+                .send_keyed(Method::POST, &path, &[], Some(&body), Some(&key))
+                .await;
+            match sent {
+                Ok(response) => {
+                    let answer: Data<Release> = response.json().await.with_context(|| {
+                        format!("the API's answer to {path} wasn't what the CLI expects")
+                    })?;
+                    return Ok(answer.data);
+                }
+                // The API answered, with a refusal: sending again wouldn't change it.
+                Err(err) if err.is::<Error>() || err.is::<Refused>() || attempt == 3 => {
+                    return Err(err);
+                }
+                Err(_) => attempt += 1,
+            }
+        }
+    }
+
     /// Asks where to upload files. A file the bucket already has, with the same content and type,
     /// comes back with no upload. The others get a signed URL to PUT to, which must start within
     /// five minutes, and their bytes are reserved against the org's storage until completed or
@@ -238,12 +301,28 @@ impl Client {
         query: &[(&str, &str)],
         body: Option<&impl Serialize>,
     ) -> anyhow::Result<Response> {
+        self.send_keyed(method, path, query, body, None).await
+    }
+
+    /// `send`, with an `Idempotency-Key` when given: the API then answers a repeat of the request
+    /// with its first answer, so it's safe to send again when no answer arrived.
+    async fn send_keyed(
+        &self,
+        method: Method,
+        path: &str,
+        query: &[(&str, &str)],
+        body: Option<&impl Serialize>,
+        idempotency_key: Option<&str>,
+    ) -> anyhow::Result<Response> {
         let mut request = self
             .http
             .request(method, format!("{}{path}", self.api_url))
             .query(query)
             .bearer_auth(&self.token)
             .header(ACCEPT, "application/json");
+        if let Some(key) = idempotency_key {
+            request = request.header("Idempotency-Key", key);
+        }
         if let Some(body) = body {
             request = request.json(body);
         }
@@ -266,6 +345,18 @@ impl Client {
             _ => Err(Error::read(response).await.into()),
         }
     }
+}
+
+/// A key no other request has: the time, this process and the path, hashed.
+fn idempotency_key(path: &str) -> String {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |since| since.as_nanos());
+    Sha256::digest(format!("{nanos}-{}-{path}", std::process::id()))
+        .iter()
+        .take(16)
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
 }
 
 /// The API path of a bucket, which its files, uploads, releases and tags hang off.
@@ -476,13 +567,13 @@ pub struct Bucket {
 }
 
 /// A name for one of a bucket's releases, such as `latest` or `stable`.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 pub struct Tag {
     pub id: String,
     pub release: ReleaseRef,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 pub struct ReleaseRef {
     pub id: String,
     /// Counts up from 1 in each bucket; people know a release by it.
@@ -558,6 +649,53 @@ pub struct Completed {
 pub struct EntryRevision {
     pub id: String,
     pub expected_revision: u64,
+}
+
+/// A release: the bucket's files as they were when it was cut. Releases don't change.
+#[derive(Debug, Deserialize, Serialize)]
+pub struct Release {
+    pub id: String,
+    /// Counts up from 1 in each bucket; people know a release by it.
+    pub release_num: u64,
+    pub name: String,
+    pub notes: Option<String>,
+    pub entry_count: u64,
+    pub size_bytes: u64,
+    /// The release this one was promoted from, if it was.
+    pub promoted_from: Option<ReleaseLink>,
+    /// The tags pointing at it now.
+    pub tags: Vec<Tag>,
+    pub create_time: DateTime<Utc>,
+}
+
+/// A release in another bucket, at the other end of a promotion.
+#[derive(Debug, Deserialize, Serialize)]
+pub struct ReleaseLink {
+    pub release_num: u64,
+    pub environment_id: String,
+    pub bucket_id: String,
+}
+
+/// How many of a bucket's files differ from its latest release.
+#[derive(Debug, Deserialize, Serialize)]
+pub struct DiffSummary {
+    pub added: u64,
+    pub changed: u64,
+    pub removed: u64,
+    pub unchanged: u64,
+    /// The bytes the files take now, minus what the latest release's take.
+    pub size_delta: i64,
+}
+
+#[derive(Deserialize)]
+struct DiffPage {
+    summary: Option<DiffSummary>,
+}
+
+#[derive(Deserialize)]
+struct ReleasePage {
+    data: Vec<Release>,
+    next_page_token: Option<String>,
 }
 
 /// One page of a bucket's files.
@@ -643,6 +781,86 @@ mod tests {
             .unwrap();
         let paths: Vec<&str> = found.iter().map(|entry| entry.path.as_str()).collect();
         assert_eq!(paths, ["a.txt", "ui/c.txt"]);
+    }
+
+    #[tokio::test]
+    async fn releases_are_the_newest_page_and_say_when_there_are_more() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path(
+                "/storage/v1/apps/app_a/environments/staging/buckets/assets/releases",
+            ))
+            .and(query_param("page_size", "2"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": [{
+                    "id": "r2", "release_num": 2, "name": "v2", "notes": null,
+                    "entry_count": 3, "size_bytes": 10, "partial": false,
+                    "promoted_from": { "id": "r9", "release_num": 9,
+                        "environment_id": "staging", "bucket_id": "assets" },
+                    "promoted_to": [], "create_time": "2026-11-10T10:00:00Z",
+                    "tags": [{ "id": "latest", "release": { "id": "r2", "release_num": 2 },
+                        "previous_release": null, "revision": 1,
+                        "update_time": "2026-11-10T10:00:00Z" }],
+                    "content_sha256": "00"
+                }],
+                "next_page_token": "more",
+            })))
+            .mount(&server)
+            .await;
+
+        let bucket = bucket_path("app_a", "staging", "assets");
+        let (releases, more) = client(&server).await.releases(&bucket, 2).await.unwrap();
+        assert!(more);
+        assert_eq!(releases[0].release_num, 2);
+        assert_eq!(releases[0].tags[0].id, "latest");
+        assert_eq!(releases[0].promoted_from.as_ref().unwrap().release_num, 9);
+    }
+
+    #[tokio::test]
+    async fn a_release_is_cut_with_an_idempotency_key() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path(
+                "/storage/v1/apps/app_a/environments/staging/buckets/assets/releases",
+            ))
+            .and(header_exists("idempotency-key"))
+            .and(body_json(json!({ "name": "v2", "notes": null })))
+            .respond_with(ResponseTemplate::new(201).set_body_json(json!({ "data": {
+                "id": "r2", "release_num": 2, "name": "v2", "notes": null,
+                "entry_count": 3, "size_bytes": 10, "promoted_from": null,
+                "create_time": "2026-11-10T10:00:00Z", "tags": [],
+            }})))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let bucket = bucket_path("app_a", "staging", "assets");
+        let release = client(&server)
+            .await
+            .create_release(&bucket, "v2", None)
+            .await
+            .unwrap();
+        assert_eq!(release.release_num, 2);
+    }
+
+    #[tokio::test]
+    async fn a_refused_release_isn_t_sent_again() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(
+                ResponseTemplate::new(409).set_body_json(json!({ "error": "promotion_only" })),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let bucket = bucket_path("app_a", "production", "assets");
+        let err = client(&server)
+            .await
+            .create_release(&bucket, "v2", None)
+            .await
+            .unwrap_err();
+        assert!(err.downcast_ref::<Error>().unwrap().is("promotion_only"));
     }
 
     #[tokio::test]

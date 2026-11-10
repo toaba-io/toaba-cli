@@ -28,25 +28,16 @@ pub fn spinner(template: &str) -> ProgressStyle {
         .tick_strings(&ticks)
 }
 
-/// Ends the line with `message`, or prints it where the line is hidden.
+/// Ends the line, leaving `message` in its place as an ordinary line of output.
 pub fn finish(line: &ProgressBar, message: String) {
-    if line.is_hidden() {
-        eprintln!("{message}");
-    } else {
-        line.set_style(plain());
-        line.finish_with_message(message);
-    }
+    line.finish_and_clear();
+    eprintln!("{message}");
 }
 
 /// Ends the line with ✗ and the step that failed. The error follows on its own line.
 pub fn failed(line: &ProgressBar, step: &str) {
-    line.set_style(plain());
-    line.abandon_with_message(format!("{} {step}", theme::failure().apply_to("✗")));
-}
-
-/// The line's text alone, without the spinner.
-fn plain() -> ProgressStyle {
-    ProgressStyle::with_template("{msg}").expect("the template is valid")
+    line.finish_and_clear();
+    eprintln!("{} {step}", theme::failure().apply_to("✗"));
 }
 
 /// A Tangerine bar of bytes done, after `label`. 209 is Tangerine among the 256 colours.

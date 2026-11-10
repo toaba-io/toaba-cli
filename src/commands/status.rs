@@ -9,7 +9,7 @@ use anyhow::bail;
 use console::style;
 use serde_json::{Value, json};
 
-use crate::output::{Output, Reported, print_json, width};
+use crate::output::{Output, Reported, pad, print_json, width};
 use crate::{api, auth, config, progress, target, theme};
 
 /// A login, or TOABA_TOKEN, and what the API says about its token.
@@ -75,7 +75,7 @@ pub async fn run(output: Output) -> anyhow::Result<()> {
         let names: Vec<String> = checked.iter().map(org_name).collect();
         let name_width = width("", &names);
         for (checked, name) in checked.iter().zip(&names) {
-            let name = format!("{name:<name_width$}");
+            let name = pad(name, name_width);
             match &checked.current {
                 Ok(current) => println!(
                     "  {} {}  {}",

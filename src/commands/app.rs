@@ -8,7 +8,7 @@ use console::style;
 use serde_json::json;
 
 use crate::api::App;
-use crate::output::{Output, print_json, sentence, width};
+use crate::output::{Output, pad, print_json, sentence, width};
 use crate::target::{self, AppArg};
 use crate::{auth, config, progress, prompt, theme};
 
@@ -78,7 +78,7 @@ async fn list(output: Output) -> anyhow::Result<()> {
         let org_width = width("ORG", apps.iter().map(|(org_name, _)| org_name));
         println!("  {:<name_width$}  {:<org_width$}  ID", "NAME", "ORG");
         for (org_name, app) in &apps {
-            let name = format!("{:<name_width$}", app.name);
+            let name = pad(&app.name, name_width);
             let (marker, name) = if used(app) {
                 ("*", style(name).bold().to_string())
             } else {
@@ -87,7 +87,11 @@ async fn list(output: Output) -> anyhow::Result<()> {
             let note = deletion(app)
                 .map(|note| format!("  {note}"))
                 .unwrap_or_default();
-            println!("{marker} {name}  {org_name:<org_width$}  {}{note}", app.id);
+            println!(
+                "{marker} {name}  {}  {}{note}",
+                pad(org_name, org_width),
+                app.id
+            );
         }
     }
 
