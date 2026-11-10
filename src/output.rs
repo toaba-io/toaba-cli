@@ -1,7 +1,13 @@
 //! How commands print their results: text for people, or JSON for scripts and agents, as glab's
 //! `--output json`. JSON goes to stdout alone; messages for people stay on stderr.
 
+use std::sync::atomic::AtomicBool;
+
 use serde::Serialize;
+
+/// Set while a command has cleaning up to do on Ctrl+C, which it then handles itself. Otherwise
+/// Ctrl+C stops the CLI at once.
+pub static CLEANS_UP_ON_CTRL_C: AtomicBool = AtomicBool::new(false);
 
 #[derive(Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
 pub enum Output {

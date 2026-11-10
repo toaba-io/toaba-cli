@@ -239,7 +239,6 @@ impl std::fmt::Display for BucketRef {
 
 impl BucketRef {
     /// Fails unless the app has this bucket, naming the buckets it does have.
-    #[allow(dead_code, reason = "for the assets commands to come")]
     pub async fn check(&self, target: &Target) -> anyhow::Result<()> {
         let mut known = Vec::new();
         for environment in target.client.environments(&target.app_id).await? {

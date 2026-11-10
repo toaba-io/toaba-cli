@@ -48,3 +48,12 @@ pub fn failed(line: &ProgressBar, step: &str) {
 fn plain() -> ProgressStyle {
     ProgressStyle::with_template("{msg}").expect("the template is valid")
 }
+
+/// A Tangerine bar of bytes done, after `label`. 209 is Tangerine among the 256 colours.
+pub fn bytes(label: &str) -> ProgressStyle {
+    ProgressStyle::with_template(&format!(
+        "{label}  {{bar:24.209/dim}}  {{bytes}} / {{total_bytes}}"
+    ))
+    .expect("the template is valid")
+    .progress_chars("━━─")
+}

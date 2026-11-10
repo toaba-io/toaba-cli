@@ -6,10 +6,12 @@ mod oauth;
 mod output;
 mod progress;
 mod prompt;
+mod sync;
 mod target;
 mod theme;
 
 use std::process::ExitCode;
+use std::sync::atomic::Ordering;
 
 use clap::{Parser, Subcommand};
 
@@ -51,10 +53,15 @@ enum Command {
 #[tokio::main]
 async fn main() -> ExitCode {
     // Ctrl+C stops at once, and gives back the cursor that a picker hides while it's open.
+    // A command with cleaning up to do handles the first Ctrl+C itself; a second one still stops.
     tokio::spawn(async {
-        if tokio::signal::ctrl_c().await.is_ok() {
-            let _ = console::Term::stderr().show_cursor();
-            std::process::exit(130);
+        let mut deferred = false;
+        while tokio::signal::ctrl_c().await.is_ok() {
+            if deferred || !output::CLEANS_UP_ON_CTRL_C.load(Ordering::Relaxed) {
+                let _ = console::Term::stderr().show_cursor();
+                std::process::exit(130);
+            }
+            deferred = true;
         }
     });
 

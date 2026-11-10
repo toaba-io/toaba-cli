@@ -44,3 +44,19 @@ pub fn confirm(question: &str, default: bool) -> anyhow::Result<bool> {
         .interact_on_opt(&console::Term::stderr())?;
     Ok(answer.unwrap_or(false))
 }
+
+/// Asks before a command changes something, unless `yes` was passed. Without a person to ask, it
+/// fails rather than wait or go ahead unasked.
+pub fn confirm_or_yes(question: &str, yes: bool) -> anyhow::Result<()> {
+    if yes {
+        return Ok(());
+    }
+    if !interactive() {
+        bail!("this changes things, pass --yes to confirm");
+    }
+    if confirm(question, false)? {
+        Ok(())
+    } else {
+        bail!("cancelled, nothing changed")
+    }
+}

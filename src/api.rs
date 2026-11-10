@@ -9,6 +9,7 @@ use std::time::Duration;
 
 use anyhow::Context as _;
 use chrono::{DateTime, Utc};
+use indicatif::HumanBytes;
 use reqwest::header::{ACCEPT, RETRY_AFTER};
 use reqwest::{Method, Response, StatusCode};
 use serde::de::DeserializeOwned;
@@ -65,7 +66,6 @@ impl Client {
         self.call(Method::GET, path, None::<&()>).await
     }
 
-    #[allow(dead_code, reason = "the foundation for the commands to come")]
     pub async fn post<T: DeserializeOwned>(
         &self,
         path: &str,
@@ -92,10 +92,16 @@ impl Client {
         self.call(Method::PATCH, path, Some(body)).await
     }
 
+    /// `POST path`, for an answer with nothing to read.
+    pub async fn post_empty(&self, path: &str, body: &impl Serialize) -> anyhow::Result<()> {
+        self.send(Method::POST, path, &[], Some(body)).await?;
+        Ok(())
+    }
+
     #[allow(dead_code, reason = "the foundation for the commands to come")]
     /// `DELETE path`. Its answer, such as a 202 or a 204, has nothing to read.
     pub async fn delete(&self, path: &str) -> anyhow::Result<()> {
-        self.send(Method::DELETE, path, None::<&()>).await?;
+        self.send(Method::DELETE, path, &[], None::<&()>).await?;
         Ok(())
     }
 
@@ -123,6 +129,88 @@ impl Client {
         .await
     }
 
+    /// Every file in the bucket, by path, read a thousand at a time.
+    pub async fn entries(
+        &self,
+        app_id: &str,
+        environment_id: &str,
+        bucket_id: &str,
+    ) -> anyhow::Result<Vec<Entry>> {
+        let path = format!("{}/entries", bucket_path(app_id, environment_id, bucket_id));
+        let mut entries = Vec::new();
+        let mut page_token: Option<String> = None;
+        loop {
+            let mut query = vec![("recursive", "true"), ("page_size", "1000")];
+            if let Some(token) = &page_token {
+                query.push(("page_token", token));
+            }
+            let page: EntryPage = self
+                .send(Method::GET, &path, &query, None::<&()>)
+                .await?
+                .json()
+                .await
+                .with_context(|| {
+                    format!("the API's answer to {path} wasn't what the CLI expects")
+                })?;
+            entries.extend(page.data);
+            match page.next_page_token {
+                Some(token) => page_token = Some(token),
+                None => return Ok(entries),
+            }
+        }
+    }
+
+    /// Asks where to upload files. A file the bucket already has, with the same content and type,
+    /// comes back with no upload. The others get a signed URL to PUT to, which must start within
+    /// five minutes, and their bytes are reserved against the org's storage until completed or
+    /// cancelled.
+    pub async fn prepare_uploads(
+        &self,
+        bucket: &str,
+        items: &[PrepareItem<'_>],
+    ) -> anyhow::Result<Vec<Prepared>> {
+        self.post(
+            &format!("{bucket}/uploads/prepare"),
+            &serde_json::json!({ "items": items }),
+        )
+        .await
+    }
+
+    /// Records uploaded files as their paths' new content. Each answers its own status.
+    pub async fn complete_uploads(
+        &self,
+        bucket: &str,
+        items: &[UploadToken],
+    ) -> anyhow::Result<Vec<Completed>> {
+        self.post(
+            &format!("{bucket}/uploads/complete"),
+            &serde_json::json!({ "items": items }),
+        )
+        .await
+    }
+
+    /// Gives up prepared uploads that weren't completed, freeing the room they reserved.
+    pub async fn cancel_uploads(&self, bucket: &str, items: &[UploadToken]) -> anyhow::Result<()> {
+        self.post_empty(
+            &format!("{bucket}/uploads/cancel"),
+            &serde_json::json!({ "items": items }),
+        )
+        .await
+    }
+
+    /// Removes files from the bucket, all or none: each must still be at the revision given.
+    pub async fn delete_entries(
+        &self,
+        bucket: &str,
+        items: &[EntryRevision],
+    ) -> anyhow::Result<()> {
+        self.post_empty(
+            &format!("{bucket}/entries/batch_delete"),
+            &serde_json::json!({ "items": items }),
+        )
+        .await
+    }
+
     /// The app's publishable keys, oldest first.
     pub async fn publishable_keys(&self, app_id: &str) -> anyhow::Result<Vec<PublishableKey>> {
         self.get(&format!("/iam/v1/apps/{app_id}/publishable_keys"))
@@ -135,7 +223,7 @@ impl Client {
         path: &str,
         body: Option<&impl Serialize>,
     ) -> anyhow::Result<T> {
-        let response = self.send(method, path, body).await?;
+        let response = self.send(method, path, &[], body).await?;
         let answer: Data<T> = response
             .json()
             .await
@@ -147,11 +235,13 @@ impl Client {
         &self,
         method: Method,
         path: &str,
+        query: &[(&str, &str)],
         body: Option<&impl Serialize>,
     ) -> anyhow::Result<Response> {
         let mut request = self
             .http
             .request(method, format!("{}{path}", self.api_url))
+            .query(query)
             .bearer_auth(&self.token)
             .header(ACCEPT, "application/json");
         if let Some(body) = body {
@@ -176,6 +266,11 @@ impl Client {
             _ => Err(Error::read(response).await.into()),
         }
     }
+}
+
+/// The API path of a bucket, which its files, uploads, releases and tags hang off.
+pub fn bucket_path(app_id: &str, environment_id: &str, bucket_id: &str) -> String {
+    format!("/storage/v1/apps/{app_id}/environments/{environment_id}/buckets/{bucket_id}")
 }
 
 #[derive(Deserialize)]
@@ -205,6 +300,8 @@ pub struct Error {
     pub code: Option<String>,
     pub fields: BTreeMap<String, Vec<String>>,
     pub retry_after: Option<u64>,
+    /// What else the answer carries, such as the byte counts of `storage_full`.
+    pub extra: BTreeMap<String, serde_json::Value>,
 }
 
 #[derive(Deserialize)]
@@ -212,6 +309,8 @@ struct ErrorBody {
     error: String,
     #[serde(default)]
     errors: BTreeMap<String, Vec<String>>,
+    #[serde(flatten)]
+    extra: BTreeMap<String, serde_json::Value>,
 }
 
 impl Error {
@@ -222,15 +321,16 @@ impl Error {
             .get(RETRY_AFTER)
             .and_then(|value| value.to_str().ok())
             .and_then(|value| value.parse().ok());
-        let (code, fields) = match response.json::<ErrorBody>().await {
-            Ok(body) => (Some(body.error), body.errors),
-            Err(_) => (None, BTreeMap::new()),
+        let (code, fields, extra) = match response.json::<ErrorBody>().await {
+            Ok(body) => (Some(body.error), body.errors, body.extra),
+            Err(_) => (None, BTreeMap::new(), BTreeMap::new()),
         };
         Self {
             status,
             code,
             fields,
             retry_after,
+            extra,
         }
     }
 
@@ -253,6 +353,33 @@ impl fmt::Display for Error {
             }
             Some("limit_reached") => f.write_str("the org has reached its plan's limit"),
             Some("name_taken") => f.write_str("that name is taken"),
+            Some("promotion_only") => f.write_str(
+                "the bucket only takes promoted releases, so its files can't be changed directly",
+            ),
+            Some("stale_entries") => {
+                f.write_str("the bucket's files changed meanwhile, run the command again")
+            }
+            Some("storage_unavailable") => {
+                f.write_str("Toaba's file storage isn't answering, try again shortly")
+            }
+            Some("storage_full") => {
+                let bytes = |key: &str| self.extra.get(key).and_then(|value| value.as_u64());
+                match (
+                    bytes("incoming_bytes"),
+                    bytes("storage_max_bytes"),
+                    bytes("stored_bytes"),
+                    bytes("reserved_bytes"),
+                ) {
+                    (Some(incoming), Some(max), Some(stored), Some(reserved)) => write!(
+                        f,
+                        "the org's storage is full: this needs {}, and {} of {} is free",
+                        HumanBytes(incoming),
+                        HumanBytes(max.saturating_sub(stored + reserved)),
+                        HumanBytes(max)
+                    ),
+                    _ => f.write_str("the org's storage is full"),
+                }
+            }
             Some("scheduled_for_deletion") => {
                 f.write_str("it's scheduled for deletion, so it can't change until it's restored")
             }
@@ -362,10 +489,90 @@ pub struct ReleaseRef {
     pub release_num: u64,
 }
 
+/// A file in a bucket.
+#[derive(Debug, Deserialize)]
+pub struct Entry {
+    pub id: String,
+    /// Its path in the bucket, with `/` between folders.
+    pub path: String,
+    /// Echoed when changing or removing the file, so a change made meanwhile isn't overwritten.
+    pub revision: u64,
+    pub current_version: Option<Version>,
+}
+
+/// The content of a file.
+#[derive(Debug, Deserialize)]
+pub struct Version {
+    pub sha256: String,
+    pub size_bytes: u64,
+    pub content_type: String,
+}
+
+/// A file to upload, as `prepare_uploads` takes it.
+#[derive(Serialize)]
+pub struct PrepareItem<'a> {
+    pub path: &'a str,
+    pub sha256: &'a str,
+    pub size_bytes: u64,
+    pub content_type: &'a str,
+}
+
+/// What to do with a file asked about in `prepare_uploads`.
+#[derive(Debug, Deserialize)]
+pub struct Prepared {
+    pub path: String,
+    /// The path's revision now, or none if it never had a file.
+    pub revision: Option<u64>,
+    /// None when the bucket has the file already, unchanged.
+    pub upload: Option<Upload>,
+}
+
+/// Where and how to PUT a file.
+#[derive(Debug, Deserialize)]
+pub struct Upload {
+    pub token: String,
+    pub url: String,
+    /// Sent with the PUT, unchanged.
+    pub headers: BTreeMap<String, String>,
+}
+
+/// An upload to complete or cancel. To complete, `expected_revision` is the revision
+/// `prepare_uploads` gave, so a change made meanwhile isn't overwritten.
+#[derive(Serialize)]
+pub struct UploadToken {
+    pub token: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expected_revision: Option<Option<u64>>,
+}
+
+/// How completing one upload went.
+#[derive(Debug, Deserialize)]
+pub struct Completed {
+    pub path: String,
+    /// `committed`, or why not: `conflict`, `pending`, `rejected` or `expired`.
+    pub status: String,
+}
+
+/// A file to remove, at the revision last read.
+#[derive(Serialize)]
+pub struct EntryRevision {
+    pub id: String,
+    pub expected_revision: u64,
+}
+
+/// One page of a bucket's files.
+#[derive(Deserialize)]
+struct EntryPage {
+    data: Vec<Entry>,
+    next_page_token: Option<String>,
+}
+
 #[cfg(test)]
 mod tests {
     use serde_json::json;
-    use wiremock::matchers::{body_json, header, header_exists, method, path};
+    use wiremock::matchers::{
+        body_json, header, header_exists, method, path, query_param, query_param_is_missing,
+    };
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     use super::*;
@@ -399,6 +606,43 @@ mod tests {
             .unwrap();
         assert_eq!(app.name, "Space Shooter");
         assert!(app.delete_time.is_none());
+    }
+
+    #[tokio::test]
+    async fn entries_come_from_every_page_of_the_flat_listing() {
+        let server = MockServer::start().await;
+        let entries = "/storage/v1/apps/app_a/environments/staging/buckets/assets/entries";
+        let entry = |id: &str, path: &str| {
+            json!({ "id": id, "path": path, "revision": 1, "current_version": {
+                "sha256": "00", "size_bytes": 1, "content_type": "text/plain"
+            }})
+        };
+        Mock::given(method("GET"))
+            .and(path(entries))
+            .and(query_param("recursive", "true"))
+            .and(query_param_is_missing("page_token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": [entry("1", "a.txt")], "folders": [], "next_page_token": "more",
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(entries))
+            .and(query_param("recursive", "true"))
+            .and(query_param("page_token", "more"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": [entry("2", "ui/c.txt")], "folders": [], "next_page_token": null,
+            })))
+            .mount(&server)
+            .await;
+
+        let found = client(&server)
+            .await
+            .entries("app_a", "staging", "assets")
+            .await
+            .unwrap();
+        let paths: Vec<&str> = found.iter().map(|entry| entry.path.as_str()).collect();
+        assert_eq!(paths, ["a.txt", "ui/c.txt"]);
     }
 
     #[tokio::test]
