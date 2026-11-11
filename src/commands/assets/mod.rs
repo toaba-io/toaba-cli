@@ -35,10 +35,11 @@ pub enum Command {
     /// a new release is cut there and its `latest` tag moves to it. Unreleased
     /// changes in the target are discarded.
     Promote(promote::Args),
-    /// Make a bucket's files match a local folder
+    /// Upload a local folder's new and changed files to a bucket
     ///
-    /// Uploads the files that are new or changed and removes the ones no longer in
-    /// the folder. Players aren't affected until a release is tagged.
+    /// Files only in the bucket stay, because a Unity Addressables content update
+    /// still loads bundles from earlier builds that it doesn't write again; pass
+    /// --delete to remove them too. Players aren't affected until a release is tagged.
     Sync(sync::Args),
     /// A bucket per branch or pull request, to try its content before it's merged
     Branch {
@@ -49,11 +50,12 @@ pub enum Command {
 
 #[derive(Subcommand)]
 pub enum BranchCommand {
-    /// Make a branch's bucket match a local folder, and release it
+    /// Upload a local folder to a branch's bucket, and release it
     ///
     /// The bucket is branches/<branch>, created the first time with the environment.
     /// With --from, a new branch starts from that bucket's latest release, so only
-    /// the files that differ are uploaded. Each sync cuts a release, which the
+    /// the files that differ are uploaded. Files only in the bucket stay, as with
+    /// `assets sync`; --delete removes them. Each sync cuts a release, which the
     /// bucket's latest tag follows. Run it again on every push.
     Sync(branch::SyncArgs),
     /// List the branches, the most recently released first

@@ -1,5 +1,5 @@
-//! `toaba assets sync`: makes a bucket's files match a local folder, then optionally cuts a release
-//! and points tags at it.
+//! `toaba assets sync`: uploads a local folder's new and changed files to a bucket, then optionally
+//! cuts a release and points tags at it.
 
 use std::path::PathBuf;
 
@@ -37,7 +37,7 @@ pub struct Args {
     tag: Vec<String>,
 }
 
-/// The options of a command that mirrors a local folder into a bucket.
+/// The options of a command that syncs a local folder into a bucket.
 #[derive(clap::Args)]
 pub(super) struct FolderArgs {
     /// Show what would change, and change nothing
@@ -49,6 +49,9 @@ pub(super) struct FolderArgs {
     /// How many files to upload at once
     #[arg(long, default_value_t = 8, value_parser = clap::value_parser!(u8).range(1..=32))]
     pub concurrency: u8,
+    /// Also remove the bucket's files that aren't in the folder, so the bucket matches it exactly
+    #[arg(long)]
+    pub delete: bool,
 }
 
 pub(super) async fn run(args: Args, output: Output) -> anyhow::Result<()> {
@@ -61,6 +64,7 @@ pub(super) async fn run(args: Args, output: Output) -> anyhow::Result<()> {
                 dry_run,
                 exclude,
                 concurrency,
+                delete,
             },
         yes,
         release: release_name,
@@ -82,7 +86,7 @@ pub(super) async fn run(args: Args, output: Output) -> anyhow::Result<()> {
     .await?;
 
     let local = hash(files).await?;
-    let plan = mirror::plan(&local, remote.iter().filter_map(api::Entry::file));
+    let plan = mirror::plan(&local, remote.iter().filter_map(api::Entry::file), delete);
     let applies = !dry_run && !plan.is_empty();
     show_plan(&plan, output, applies && !yes.yes);
 
@@ -211,6 +215,7 @@ pub(super) fn with_plan(plan: &mirror::Plan, fields: serde_json::Value) -> serde
         "new": plan.new,
         "changed": plan.changed,
         "removed": plan.removed,
+        "kept": plan.kept,
         "unchanged_count": plan.unchanged_count,
         "upload_bytes": plan.upload_bytes(),
     });
@@ -266,19 +271,32 @@ fn plan_text(plan: &mirror::Plan, stdout: bool) -> String {
             text.push_str(&format!("  {mark} {}\n", dim(&more)));
         }
     }
+    // Removed and kept files are counted only when there are some. Kept files are never listed:
+    // a bucket gathers old bundles over time.
+    let tally = |n: usize, what: &str| match n {
+        0 => String::new(),
+        n => format!(", {n} {what}"),
+    };
+    let kept = tally(plan.kept.len(), "only in the bucket");
     if plan.is_empty() {
         text.push_str(&format!(
-            "Nothing to do: all {} files match\n",
+            "Nothing to do: all {} files match{kept}\n",
             plan.unchanged_count
         ));
     } else {
+        let removed = tally(plan.removed.len(), "to remove");
         text.push_str(&format!(
-            "{} new, {} changed, {} to remove, {} unchanged · {} to upload\n",
+            "{} new, {} changed{removed}, {} unchanged{kept} · {} to upload\n",
             plan.new.len(),
             plan.changed.len(),
-            plan.removed.len(),
             plan.unchanged_count,
             HumanBytes(plan.upload_bytes())
+        ));
+    }
+    if !plan.kept.is_empty() {
+        text.push_str(&format!(
+            "{}\n",
+            dim("Files only in the bucket stay; --delete removes them")
         ));
     }
     text
@@ -305,6 +323,35 @@ mod tests {
         assert!(text.contains("… and 5 more new"));
         assert!(!text.contains("file-020.txt"));
         assert_eq!(text.matches("to remove\n").count(), 3);
-        assert!(text.contains("25 new, 0 changed, 3 to remove"));
+        assert!(text.contains("25 new, 0 changed, 3 to remove, 0 unchanged ·"));
+        assert!(!text.contains("--delete"));
+    }
+
+    #[test]
+    fn kept_files_are_counted_with_a_hint_rather_than_listed() {
+        let change = |n: usize| mirror::Change {
+            path: format!("old-{n}.bundle"),
+            size_bytes: 1,
+        };
+        let plan = mirror::Plan {
+            new: vec![change(9)],
+            kept: (0..2).map(change).collect(),
+            unchanged_count: 4,
+            ..Default::default()
+        };
+        let text = plan_text(&plan, true);
+        assert!(!text.contains("old-0.bundle"));
+        assert!(text.contains("1 new, 0 changed, 4 unchanged, 2 only in the bucket ·"));
+        assert!(text.contains("--delete removes them"));
+
+        let nothing = mirror::Plan {
+            kept: plan.kept,
+            unchanged_count: 4,
+            ..Default::default()
+        };
+        assert!(
+            plan_text(&nothing, true)
+                .starts_with("Nothing to do: all 4 files match, 2 only in the bucket\n")
+        );
     }
 }

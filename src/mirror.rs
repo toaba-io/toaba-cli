@@ -1,6 +1,7 @@
-//! Mirroring a folder into a bucket, for `toaba assets sync`: what it works out before changing anything (the files of a local folder,
-//! and how they differ from a bucket's), then making the bucket match. A file has changed when its
-//! SHA-256 or its content type has.
+//! Syncing a folder into a bucket, for `toaba assets sync`: what it works out before changing
+//! anything (the files of a local folder, and how they differ from a bucket's), then uploading the
+//! new and changed files and, with `--delete`, removing the bucket's files the folder lacks. A
+//! file has changed when its SHA-256 or its content type has.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::File;
@@ -36,7 +37,7 @@ pub struct LocalFile {
     pub content_type: String,
 }
 
-/// A file the sync uploads or removes.
+/// A file in the plan: its path and size.
 #[derive(Debug, Serialize, PartialEq, Eq)]
 pub struct Change {
     pub path: String,
@@ -50,12 +51,16 @@ pub struct Plan {
     pub new: Vec<Change>,
     /// Files whose content or content type differs.
     pub changed: Vec<Change>,
-    /// Files only the bucket has, which a sync removes.
+    /// Files only the bucket has, which a sync with `--delete` removes.
     pub removed: Vec<Change>,
+    /// Files only the bucket has, which a sync keeps: a Unity content update's catalog can
+    /// still load from bundles of an earlier build that the new build didn't write again.
+    pub kept: Vec<Change>,
     pub unchanged_count: usize,
 }
 
 impl Plan {
+    /// Whether the sync has nothing to do. Kept files need nothing.
     pub fn is_empty(&self) -> bool {
         self.new.is_empty() && self.changed.is_empty() && self.removed.is_empty()
     }
@@ -175,10 +180,12 @@ fn sha256(path: &Path, progress: &ProgressBar) -> anyhow::Result<String> {
 }
 
 /// How the local files differ from the remote ones, each a path and its content: a bucket's
-/// files, or the release a new bucket will start from.
+/// files, or the release a new bucket will start from. Remote files the folder lacks are
+/// removed when `delete`, and kept otherwise.
 pub fn plan<'a>(
     local: &[LocalFile],
     remote: impl IntoIterator<Item = (&'a str, &'a api::Version)>,
+    delete: bool,
 ) -> Plan {
     let mut remote: BTreeMap<&str, &api::Version> = remote.into_iter().collect();
     let mut plan = Plan::default();
@@ -197,13 +204,18 @@ pub fn plan<'a>(
             Some(_) => plan.changed.push(change()),
         }
     }
-    plan.removed = remote
+    let only_remote = remote
         .into_iter()
         .map(|(path, version)| Change {
             path: path.to_string(),
             size_bytes: version.size_bytes,
         })
         .collect();
+    if delete {
+        plan.removed = only_remote;
+    } else {
+        plan.kept = only_remote;
+    }
     plan
 }
 
@@ -219,7 +231,7 @@ const STALL: Duration = Duration::from_secs(60);
 const ATTEMPTS: u32 = 3;
 
 /// Makes the bucket match the plan: uploads the new and changed files, `concurrency` at a time,
-/// moving `bar` by the bytes sent, then removes the files gone from the folder. Uploads count only
+/// moving `bar` by the bytes sent, then removes the plan's `removed` files. Uploads count only
 /// once completed; on a failure or Ctrl+C the unfinished ones are cancelled, so they hold no room.
 pub async fn apply(
     bucket: &api::BucketApi<'_>,
@@ -549,32 +561,44 @@ mod tests {
     }
 
     #[test]
-    fn a_plan_sorts_files_into_new_changed_removed_and_unchanged() {
+    fn a_plan_sorts_files_into_new_changed_kept_or_removed_and_unchanged() {
+        let local = [
+            local("new.txt", "aa", "text/plain"),
+            local("same.txt", "bb", "text/plain"),
+            local("edited.txt", "cc", "text/plain"),
+            local("retyped.json", "dd", "application/json"),
+        ];
         let remote = [
             remote("same.txt", "bb", "text/plain"),
             remote("edited.txt", "00", "text/plain"),
             remote("retyped.json", "dd", "text/plain"),
             remote("gone.txt", "ee", "text/plain"),
         ];
-        let plan = plan(
-            &[
-                local("new.txt", "aa", "text/plain"),
-                local("same.txt", "bb", "text/plain"),
-                local("edited.txt", "cc", "text/plain"),
-                local("retyped.json", "dd", "application/json"),
-            ],
-            remote.iter().filter_map(api::Entry::file),
-        );
-
+        let plan_with = |delete| plan(&local, remote.iter().filter_map(api::Entry::file), delete);
         let paths = |changes: &[Change]| -> Vec<String> {
             changes.iter().map(|change| change.path.clone()).collect()
         };
-        assert_eq!(paths(&plan.new), ["new.txt"]);
-        assert_eq!(paths(&plan.changed), ["edited.txt", "retyped.json"]);
-        assert_eq!(paths(&plan.removed), ["gone.txt"]);
-        assert_eq!(plan.removed[0].size_bytes, 7);
-        assert_eq!(plan.unchanged_count, 1);
-        assert_eq!(plan.upload_bytes(), 30);
+
+        let kept = plan_with(false);
+        assert_eq!(paths(&kept.new), ["new.txt"]);
+        assert_eq!(paths(&kept.changed), ["edited.txt", "retyped.json"]);
+        assert_eq!(paths(&kept.kept), ["gone.txt"]);
+        assert!(kept.removed.is_empty());
+        assert_eq!(kept.unchanged_count, 1);
+        assert_eq!(kept.upload_bytes(), 30);
+
+        let removed = plan_with(true);
+        assert_eq!(paths(&removed.removed), ["gone.txt"]);
+        assert_eq!(removed.removed[0].size_bytes, 7);
+        assert!(removed.kept.is_empty());
+    }
+
+    #[test]
+    fn files_only_in_the_bucket_need_nothing_unless_they_go() {
+        let remote = [remote("old.bundle", "ee", "application/octet-stream")];
+        let files = || remote.iter().filter_map(api::Entry::file);
+        assert!(plan(&[], files(), false).is_empty());
+        assert!(!plan(&[], files(), true).is_empty());
     }
 
     #[test]

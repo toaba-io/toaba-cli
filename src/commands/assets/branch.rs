@@ -96,6 +96,7 @@ pub(super) async fn sync(args: SyncArgs, output: Output) -> anyhow::Result<()> {
                 dry_run,
                 exclude,
                 concurrency,
+                delete,
             },
         yes,
     } = args;
@@ -133,8 +134,12 @@ pub(super) async fn sync(args: SyncArgs, output: Output) -> anyhow::Result<()> {
 
     let local = hash(files).await?;
     let mut plan = match &start {
-        Some(start) => mirror::plan(&local, start.files.iter().map(api::ReleaseFile::file)),
-        None => mirror::plan(&local, remote.iter().filter_map(api::Entry::file)),
+        Some(start) => mirror::plan(
+            &local,
+            start.files.iter().map(api::ReleaseFile::file),
+            delete,
+        ),
+        None => mirror::plan(&local, remote.iter().filter_map(api::Entry::file), delete),
     };
     let creates = existing.is_none();
     let applies = !dry_run && (creates || start.is_some() || !plan.is_empty());
@@ -206,7 +211,7 @@ pub(super) async fn sync(args: SyncArgs, output: Output) -> anyhow::Result<()> {
                 start.source,
                 release_size(&promoted)
             );
-            plan = mirror::plan(&local, remote.iter().filter_map(api::Entry::file));
+            plan = mirror::plan(&local, remote.iter().filter_map(api::Entry::file), delete);
         }
         if !plan.is_empty() {
             upload(
