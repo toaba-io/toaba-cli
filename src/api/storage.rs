@@ -306,7 +306,7 @@ pub struct Bucket {
     pub tags: Vec<Tag>,
 }
 
-/// A name for one of a bucket's releases, such as `latest` or `stable`.
+/// A name for one of a bucket's releases, such as `latest` or `live`.
 #[derive(Debug, Deserialize, Serialize)]
 pub struct Tag {
     pub id: String,

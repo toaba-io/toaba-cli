@@ -1,11 +1,11 @@
 # toaba
 
-The command-line tool for [Toaba](https://toaba.io). It publishes a game's content from a
-terminal or a build pipeline: sync a folder into a bucket, cut a release, point a tag at it, and
-promote it from staging to production.
+The command-line tool for [Toaba](https://toaba.io), the PaaS for live games. It publishes a
+game's content from a terminal or a build pipeline: upload a build folder to a bucket, cut a
+release, point a tag at it, and promote it from staging to production. Setting things up (apps,
+environments, buckets, keys) stays in the dashboard.
 
-Setting things up (apps, environments, buckets, keys) is done in the dashboard. The CLI covers
-what each build does.
+**Documentation: [docs.toaba.io/docs/cli](https://docs.toaba.io/docs/cli)**
 
 ## Install
 
@@ -21,148 +21,38 @@ On Windows, in PowerShell:
 powershell -ExecutionPolicy Bypass -c "irm https://github.com/toaba-io/toaba-cli/releases/latest/download/toaba-cli-installer.ps1 | iex"
 ```
 
-Either puts `toaba` in `~/.toaba/bin` and adds it to your `PATH`. The archives, with checksums,
-are on the [releases page](https://github.com/toaba-io/toaba-cli/releases).
-
-There are no macOS builds for now. On a Mac, or to build from source anywhere, with a Rust
-toolchain:
+Either puts `toaba` in `~/.toaba/bin` and adds it to your `PATH`. There are no macOS builds for
+now. On a Mac, or to build from source anywhere, with a Rust toolchain:
 
 ```sh
 cargo install --locked --git https://github.com/toaba-io/toaba-cli
 ```
 
-## Log in
+## Quick start
 
 ```sh
-toaba login      # opens the browser; one login per org
-toaba status     # your logins, and the app commands use
-toaba app list   # the apps your logins reach
-toaba app use my-game
-```
+toaba login                     # log in through the browser
+toaba app use "Space Shooter"   # the app commands act on
 
-Every command acts on the app in use. To name another for one command, pass `--app`, by name or
-id.
-
-## Publish content
-
-A bucket is written `env/bucket`, such as `staging/assets`.
-
-```sh
-# See what a sync would change, without changing anything
-toaba assets sync ./build staging/assets --dry-run
-
-# Upload the folder's new and changed files, cut a release, and point a tag at it
-toaba assets sync ./build staging/assets --release v1.4 --tag beta
+# Upload a build's new and changed files, release it, and tag it beta
+toaba assets sync ./build staging/android --release v1.4 --tag beta
 
 # Publish that release in production, and move the tag players download by
-toaba assets promote staging/assets beta production/assets --name v1.4 --tag live
-
-# Roll back: point the tag at an older release
-toaba assets tag set live production/assets 41
+toaba assets promote staging/android beta production/android --name v1.4 --tag live
 ```
 
-`sync` keeps files that are in the bucket but not in the folder. A Unity Addressables content
-update needs that: its catalog still loads unchanged bundles of earlier builds, which the update
-build doesn't write again. Pass `--delete` to remove them too, so the bucket matches the folder
-exactly. Game clients download by tag, so nothing reaches players until a tag moves.
+Commands that change something show their plan and ask first; `--yes` skips the question, and
+`-o json` gives output a script can read.
 
-Commands that change something show what they are about to do and ask first. Pass `--yes` to skip
-the question.
+## Guides
 
-To look around:
-
-```sh
-toaba assets bucket list
-toaba assets release list staging/assets
-toaba assets tag list production/assets
-toaba app keys --env    # TOABA_APP_ID and TOABA_PUBLISHABLE_KEY, for a game build
-```
-
-## In CI
-
-A pipeline doesn't log in. Create a service account and a token for it in the dashboard, then set:
-
-| Variable | What it is |
-| --- | --- |
-| `TOABA_TOKEN` | The service account's token |
-| `TOABA_APP` | The app, by id or name |
-
-```sh
-curl --proto '=https' --tlsv1.2 -LsSf https://github.com/toaba-io/toaba-cli/releases/latest/download/toaba-cli-installer.sh | sh
-export PATH="$HOME/.toaba/bin:$PATH"    # GitHub Actions needs no export: the installer handles it
-toaba assets sync ./build staging/assets --release "$VERSION" --tag beta --yes
-```
-
-Without a terminal, a command that would ask a question fails unless it gets `--yes`. Add
-`-o json` to any command for output a script can read: results go to stdout, messages to stderr,
-and a failure prints `{"error": "…"}` with a non-zero exit code.
-
-## A bucket per pull request
-
-`toaba assets branch` gives each branch or pull request its own bucket, `branches/<branch>`, so
-its content can be tried before it's merged: point a game build at that bucket's `latest` tag.
-
-```sh
-# On every push: make the bucket match the folder, and release it
-toaba assets branch sync ./build pr-123 --from staging/assets --yes
-
-toaba assets branch list                  # the branches, most recently released first
-toaba assets branch close pr-123 --yes    # once the pull request is merged or closed
-```
-
-The first sync creates the `branches` environment and the bucket. With `--from`, a new branch
-starts from that bucket's latest release, so only the files that differ are uploaded; later syncs
-ignore it, so a pipeline can run the same command every time. The token needs write access to the
-app's storage.
-
-A git branch's name can be the branch too: it becomes an id, so `feature/New-UI` is
-`branches/feature-new-ui`, and `close` takes the same name. Names that differ only in case or
-punctuation, such as `feature/new-ui` and `feature-new-ui`, share a bucket; pull request numbers
-never do.
-
-In GitHub Actions:
-
-```yaml
-on:
-  pull_request:
-    types: [opened, synchronize, reopened, closed]
-
-env:
-  TOABA_TOKEN: ${{ secrets.TOABA_TOKEN }}
-  TOABA_APP: ${{ vars.TOABA_APP }}
-  BRANCH: pr-${{ github.event.pull_request.number }}
-  INSTALL: https://github.com/toaba-io/toaba-cli/releases/latest/download/toaba-cli-installer.sh
-
-# One run at a time per pull request, so two never sync the same bucket at once
-concurrency:
-  group: toaba-${{ github.event.pull_request.number }}
-
-jobs:
-  sync:
-    if: github.event.action != 'closed'
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v7
-      - run: ./build-content.sh    # your build, writing ./build
-      - run: curl --proto '=https' --tlsv1.2 -LsSf "$INSTALL" | sh
-      - run: toaba assets branch sync ./build "$BRANCH" --from staging/assets --yes
-
-  close:
-    if: github.event.action == 'closed'
-    runs-on: ubuntu-latest
-    steps:
-      - run: curl --proto '=https' --tlsv1.2 -LsSf "$INSTALL" | sh
-      - run: toaba assets branch close "$BRANCH" --yes
-```
-
-Pull requests from forks don't get the repository's secrets, so these jobs fail for them: someone
-outside the project can't write to your buckets.
-
-## Files
-
-The CLI keeps its state in `~/.config/toaba` (`$XDG_CONFIG_HOME/toaba`, or `%APPDATA%\toaba` on
-Windows): `config.toml` holds your logins and the app in use, and `credentials.toml`, readable
-only by you, holds their tokens. `toaba logout` ends a login on Toaba and removes it from both.
+- [Install, log in, and choose an app](https://docs.toaba.io/docs/cli/login)
+- [Use the CLI in CI](https://docs.toaba.io/docs/cli/ci) with a service account token
+- [Publish from CI](https://docs.toaba.io/docs/content/publish-from-ci): staging on every merge,
+  production on a version tag
+- [A bucket per pull request](https://docs.toaba.io/docs/content/branch-buckets)
+- [Migrate from Unity CCD](https://docs.toaba.io/docs/content/migrate-from-unity-ccd), with a
+  `ugs ccd` command mapping
 
 ## License
 

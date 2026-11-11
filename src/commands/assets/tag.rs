@@ -34,7 +34,7 @@ pub struct ListArgs {
 
 #[derive(clap::Args)]
 pub struct SetArgs {
-    /// The tag, such as stable
+    /// The tag, such as live
     #[arg(value_parser = tag_name)]
     tag: String,
     /// The bucket, as env/bucket
