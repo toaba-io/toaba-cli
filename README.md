@@ -45,18 +45,20 @@ A bucket is written `env/bucket`, such as `staging/assets`.
 # See what a sync would change, without changing anything
 toaba assets sync ./build staging/assets --dry-run
 
-# Make the bucket match the folder, cut a release, and point a tag at it
+# Upload the folder's new and changed files, cut a release, and point a tag at it
 toaba assets sync ./build staging/assets --release v1.4 --tag beta
 
 # Publish that release in production, and move the tag players download by
-toaba assets promote staging/assets beta production/assets --tag stable
+toaba assets promote staging/assets beta production/assets --name v1.4 --tag live
 
 # Roll back: point the tag at an older release
-toaba assets tag set stable production/assets 41
+toaba assets tag set live production/assets 41
 ```
 
-`sync` is a mirror: files that are gone from the folder are removed from the bucket. Game clients
-download by tag, so nothing reaches players until a tag moves.
+`sync` keeps files that are in the bucket but not in the folder. A Unity Addressables content
+update needs that: its catalog still loads unchanged bundles of earlier builds, which the update
+build doesn't write again. Pass `--delete` to remove them too, so the bucket matches the folder
+exactly. Game clients download by tag, so nothing reaches players until a tag moves.
 
 Commands that change something show what they are about to do and ask first. Pass `--yes` to skip
 the question.
