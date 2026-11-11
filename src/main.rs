@@ -7,6 +7,8 @@ mod oauth;
 mod output;
 mod progress;
 mod prompt;
+#[cfg(test)]
+mod reference;
 mod target;
 mod theme;
 

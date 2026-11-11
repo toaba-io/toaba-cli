@@ -1,0 +1,290 @@
+---
+title: Command reference
+description: Every toaba command, with its arguments and options.
+---
+
+{/* Generated from the CLI's own help by toaba-cli's tests. Don't edit it here. */}
+
+Every command also shows this with `--help`, such as `toaba assets sync --help`.
+
+## Global options
+
+Every command takes these.
+
+| Option | Description |
+| --- | --- |
+| `-o`, `--output <OUTPUT>` | How to print results: text for people, json for scripts and agents. One of `text`, `json`. Default: `text`. |
+
+## toaba login
+
+Log in to one of your orgs through the browser.
+
+```text
+toaba login [OPTIONS]
+```
+
+## toaba logout
+
+Log out of an org, ending the login on Toaba.
+
+```text
+toaba logout [OPTIONS] [ORG]
+```
+
+| Argument | Description |
+| --- | --- |
+| `[ORG]` | The org to log out of, by name or id; asked when you have several logins. |
+
+## toaba status
+
+Show your logins, whether they still work, and the app commands use.
+
+With TOABA_TOKEN set, shows that token alone. Exits with code 1 when you aren't logged in or a login has ended.
+
+```text
+toaba status [OPTIONS]
+```
+
+Aliases: `s`, `st`
+
+## toaba app list
+
+List the apps your logins reach; \* marks the one in use.
+
+```text
+toaba app list [OPTIONS]
+```
+
+Aliases: `ls`
+
+## toaba app use
+
+Make an app the one commands use.
+
+```text
+toaba app use [OPTIONS] [APP]
+```
+
+| Argument | Description |
+| --- | --- |
+| `[APP]` | The app, by name or id; picked from a list when left out. |
+
+## toaba app keys
+
+List the app's publishable keys, which game clients ship with.
+
+They're created and revoked in the dashboard. With --env, prints the app's id and its newest key as TOABA_APP_ID and TOABA_PUBLISHABLE_KEY, for a game build's environment.
+
+```text
+toaba app keys [OPTIONS]
+```
+
+| Option | Description |
+| --- | --- |
+| `--app <APP>` | The app, by name or id [default: TOABA_APP, then the app in use]. Environment: `TOABA_APP`. |
+| `--env` | Print TOABA_APP_ID and TOABA_PUBLISHABLE_KEY lines instead of a table. |
+
+## toaba assets bucket list
+
+List the app's buckets, in every environment.
+
+```text
+toaba assets bucket list [OPTIONS]
+```
+
+Aliases: `ls`
+
+| Option | Description |
+| --- | --- |
+| `--app <APP>` | The app, by name or id [default: TOABA_APP, then the app in use]. Environment: `TOABA_APP`. |
+
+## toaba assets release list
+
+List a bucket's releases, newest first.
+
+```text
+toaba assets release list [OPTIONS] <BUCKET>
+```
+
+Aliases: `ls`
+
+| Argument | Description |
+| --- | --- |
+| `<BUCKET>` | The bucket, as env/bucket. |
+
+| Option | Description |
+| --- | --- |
+| `--app <APP>` | The app, by name or id [default: TOABA_APP, then the app in use]. Environment: `TOABA_APP`. |
+| `--limit <LIMIT>` | How many releases to show at most. Default: `20`. |
+
+## toaba assets release create
+
+Cut a release of a bucket's files as they are now.
+
+The bucket's `latest` tag moves to the new release, so game clients that follow `latest` get it. Other tags stay where they are.
+
+```text
+toaba assets release create [OPTIONS] <BUCKET> <NAME>
+```
+
+Aliases: `new`
+
+| Argument | Description |
+| --- | --- |
+| `<BUCKET>` | The bucket, as env/bucket. |
+| `<NAME>` | A name for the release, such as v1.4. |
+
+| Option | Description |
+| --- | --- |
+| `--app <APP>` | The app, by name or id [default: TOABA_APP, then the app in use]. Environment: `TOABA_APP`. |
+| `--notes <NOTES>` | Notes to keep with the release. |
+| `-y`, `--yes` | Go ahead without asking; needed where there's nobody to ask, as in CI. |
+
+## toaba assets tag list
+
+List a bucket's tags and the releases they point at.
+
+```text
+toaba assets tag list [OPTIONS] <BUCKET>
+```
+
+Aliases: `ls`
+
+| Argument | Description |
+| --- | --- |
+| `<BUCKET>` | The bucket, as env/bucket. |
+
+| Option | Description |
+| --- | --- |
+| `--app <APP>` | The app, by name or id [default: TOABA_APP, then the app in use]. Environment: `TOABA_APP`. |
+
+## toaba assets tag set
+
+Point a tag at a release, creating the tag or moving it.
+
+Game clients that download by the tag get that release. Moving a tag back to an older release is how to roll back. `latest` can't be set: it follows new releases by itself.
+
+```text
+toaba assets tag set [OPTIONS] <TAG> <BUCKET> <RELEASE>
+```
+
+| Argument | Description |
+| --- | --- |
+| `<TAG>` | The tag, such as live. |
+| `<BUCKET>` | The bucket, as env/bucket. |
+| `<RELEASE>` | The release: its number, or another tag to point at the same release, such as latest. |
+
+| Option | Description |
+| --- | --- |
+| `--app <APP>` | The app, by name or id [default: TOABA_APP, then the app in use]. Environment: `TOABA_APP`. |
+| `-y`, `--yes` | Go ahead without asking; needed where there's nobody to ask, as in CI. |
+
+## toaba assets promote
+
+Publish a release of one bucket in another, such as staging to production.
+
+The target bucket's files become the release's, without copying any bytes; a new release is cut there and its `latest` tag moves to it. Unreleased changes in the target are discarded.
+
+```text
+toaba assets promote [OPTIONS] <SOURCE> <RELEASE> <TARGET>
+```
+
+| Argument | Description |
+| --- | --- |
+| `<SOURCE>` | The bucket the release is in, as env/bucket. |
+| `<RELEASE>` | The release: its number, or a tag of the source bucket, such as latest. |
+| `<TARGET>` | The bucket to publish it in, as env/bucket. |
+
+| Option | Description |
+| --- | --- |
+| `--app <APP>` | The app, by name or id [default: TOABA_APP, then the app in use]. Environment: `TOABA_APP`. |
+| `--tag <TAG>` | Point this tag of the target bucket at the new release; repeatable. |
+| `--name <NAME>` | A name for the new release, such as v1.4 [default: the promoted release's]. |
+| `--notes <NOTES>` | Notes to keep with the new release [default: the promoted release's]. |
+| `-y`, `--yes` | Go ahead without asking; needed where there's nobody to ask, as in CI. |
+
+## toaba assets sync
+
+Upload a local folder's new and changed files to a bucket.
+
+Files only in the bucket stay, because a Unity Addressables content update still loads bundles from earlier builds that it doesn't write again; pass --delete to remove them too. Players aren't affected until a release is tagged.
+
+```text
+toaba assets sync [OPTIONS] <DIR> <BUCKET>
+```
+
+| Argument | Description |
+| --- | --- |
+| `<DIR>` | The local folder. |
+| `<BUCKET>` | The bucket, as env/bucket. |
+
+| Option | Description |
+| --- | --- |
+| `--app <APP>` | The app, by name or id [default: TOABA_APP, then the app in use]. Environment: `TOABA_APP`. |
+| `--dry-run` | Show what would change, and change nothing. |
+| `--exclude <GLOB>` | Leave out local files matching this pattern, such as '\*.meta'; repeatable. |
+| `--concurrency <CONCURRENCY>` | How many files to upload at once. Default: `8`. |
+| `--delete` | Also remove the bucket's files that aren't in the folder, so the bucket matches it exactly. |
+| `-y`, `--yes` | Go ahead without asking; needed where there's nobody to ask, as in CI. |
+| `--release <NAME>` | After syncing, cut a release with this name, such as v1.4. |
+| `--notes <NOTES>` | Notes to keep with the release. |
+| `--tag <TAG>` | Point this tag at the new release, creating or moving it; repeatable. |
+
+## toaba assets branch sync
+
+Upload a local folder to a branch's bucket, and release it.
+
+The bucket is branches/\<branch>, created the first time with the environment. With --from, a new branch starts from that bucket's latest release, so only the files that differ are uploaded. Files only in the bucket stay, as with `assets sync`; --delete removes them. Each sync cuts a release, which the bucket's latest tag follows. Run it again on every push.
+
+```text
+toaba assets branch sync [OPTIONS] <DIR> <BRANCH>
+```
+
+| Argument | Description |
+| --- | --- |
+| `<DIR>` | The local folder. |
+| `<BRANCH>` | The branch, such as pr-123, or a git branch made an id, feature/New-UI becoming feature-new-ui: its bucket is branches/\<branch>. |
+
+| Option | Description |
+| --- | --- |
+| `--from <BUCKET>` | Start a new branch from this bucket's latest release, as env/bucket, so only the files that differ are uploaded. |
+| `--release <NAME>` | A name for the release, such as the commit [default: the branch]. |
+| `--app <APP>` | The app, by name or id [default: TOABA_APP, then the app in use]. Environment: `TOABA_APP`. |
+| `--dry-run` | Show what would change, and change nothing. |
+| `--exclude <GLOB>` | Leave out local files matching this pattern, such as '\*.meta'; repeatable. |
+| `--concurrency <CONCURRENCY>` | How many files to upload at once. Default: `8`. |
+| `--delete` | Also remove the bucket's files that aren't in the folder, so the bucket matches it exactly. |
+| `-y`, `--yes` | Go ahead without asking; needed where there's nobody to ask, as in CI. |
+
+## toaba assets branch list
+
+List the branches, the most recently released first.
+
+```text
+toaba assets branch list [OPTIONS]
+```
+
+Aliases: `ls`
+
+| Option | Description |
+| --- | --- |
+| `--app <APP>` | The app, by name or id [default: TOABA_APP, then the app in use]. Environment: `TOABA_APP`. |
+
+## toaba assets branch close
+
+Delete a branch's bucket, with its files and releases, once it's merged or closed.
+
+Asks first, unless --yes is passed. A branch that's already gone is fine.
+
+```text
+toaba assets branch close [OPTIONS] <BRANCH>
+```
+
+| Argument | Description |
+| --- | --- |
+| `<BRANCH>` | The branch, as `branch sync` was given it, such as pr-123 or feature/New-UI. |
+
+| Option | Description |
+| --- | --- |
+| `--app <APP>` | The app, by name or id [default: TOABA_APP, then the app in use]. Environment: `TOABA_APP`. |
+| `-y`, `--yes` | Go ahead without asking; needed where there's nobody to ask, as in CI. |
