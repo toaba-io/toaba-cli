@@ -14,6 +14,10 @@ was missing bundles its catalog needs.
 The plan counts the files that stay, such as `2 only in the bucket`, and `-o json` lists them under
 `kept`.
 
+There are no macOS builds for now: GitHub's Apple-silicon runners were too often unavailable to
+finish a release. On a Mac, build from source with
+`cargo install --locked --git https://github.com/toaba-io/toaba-cli`.
+
 ## 0.1.0
 
 The first release: log in, choose an app, sync a folder into a bucket, cut releases, point tags at

@@ -6,7 +6,6 @@ accepted = ["Apache-2.0", "MIT", "BSD-3-Clause", "ISC", "Unicode-3.0", "CDLA-Per
 
 # The platforms releases are built for, so platform-only dependencies are listed too.
 targets = [
-    "aarch64-apple-darwin",
     "x86_64-pc-windows-msvc",
     "aarch64-unknown-linux-musl",
     "x86_64-unknown-linux-musl",

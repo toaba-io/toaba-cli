@@ -9,7 +9,7 @@ what each build does.
 
 ## Install
 
-On macOS and Linux:
+On Linux:
 
 ```sh
 curl --proto '=https' --tlsv1.2 -LsSf https://github.com/toaba-io/toaba-cli/releases/latest/download/toaba-cli-installer.sh | sh
@@ -22,8 +22,14 @@ powershell -ExecutionPolicy Bypass -c "irm https://github.com/toaba-io/toaba-cli
 ```
 
 Either puts `toaba` in `~/.toaba/bin` and adds it to your `PATH`. The archives, with checksums,
-are on the [releases page](https://github.com/toaba-io/toaba-cli/releases). To build from source
-instead, with a Rust toolchain: `cargo install --path .`
+are on the [releases page](https://github.com/toaba-io/toaba-cli/releases).
+
+There are no macOS builds for now. On a Mac, or to build from source anywhere, with a Rust
+toolchain:
+
+```sh
+cargo install --locked --git https://github.com/toaba-io/toaba-cli
+```
 
 ## Log in
 

@@ -3460,7 +3460,6 @@ limitations under the License.
 - [bitflags 2.13.2](https://github.com/bitflags/bitflags)
 - [bstr 1.13.1](https://github.com/BurntSushi/bstr)
 - [cfg-if 1.0.5](https://github.com/rust-lang/cfg-if)
-- [core-foundation-sys 0.8.7](https://github.com/servo/core-foundation-rs)
 - [displaydoc 0.2.7](https://github.com/yaahc/displaydoc)
 - [errno 0.3.14](https://github.com/lambda-fairy/rust-errno)
 - [form_urlencoded 1.2.2](https://github.com/servo/rust-url)
