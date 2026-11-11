@@ -5,7 +5,7 @@ crates that use it.
 
 ## Apache License 2.0
 
-- [toaba-cli 0.1.0](https://github.com/toaba-io/toaba-cli)
+- [toaba-cli 0.2.0](https://github.com/toaba-io/toaba-cli)
 - [encode_unicode 1.0.0](https://github.com/tormol/encode_unicode)
 - [utf8_iter 1.1.0](https://github.com/hsivonen/utf8_iter)
 - [utf_types 1.0.0](https://github.com/hsivonen/utf_types)
