@@ -349,14 +349,7 @@ impl Error {
         }
         let named: Vec<String> = files
             .iter()
-            .map(|file| {
-                format!(
-                    "{} ({}, {})",
-                    crate::output::plain(&file.path),
-                    crate::output::plain(&file.content_type),
-                    HumanBytes(file.size_bytes)
-                )
-            })
+            .map(|file| crate::output::file(&file.path, &file.content_type, file.size_bytes))
             .collect();
         format!(
             "{refuse} {} of the release's files: {}",

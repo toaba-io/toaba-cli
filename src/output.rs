@@ -4,6 +4,7 @@
 use std::sync::atomic::AtomicBool;
 
 use chrono::{DateTime, Utc};
+use indicatif::HumanBytes;
 use serde::Serialize;
 
 /// Set while a command has cleaning up to do on Ctrl+C, which it then handles itself. Otherwise
@@ -59,6 +60,16 @@ pub fn plain(text: &str) -> String {
     text.chars()
         .map(|c| if c.is_control() { '\u{fffd}' } else { c })
         .collect()
+}
+
+/// A file with its type and size, such as `ui/logo.png (image/png, 3.00 KiB)`.
+pub fn file(path: &str, content_type: &str, size_bytes: u64) -> String {
+    format!(
+        "{} ({}, {})",
+        plain(path),
+        plain(content_type),
+        HumanBytes(size_bytes)
+    )
 }
 
 /// `text` cut to `max` terminal cells, ending in … when it was longer.

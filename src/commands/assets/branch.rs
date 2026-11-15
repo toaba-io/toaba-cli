@@ -4,14 +4,14 @@
 
 use std::path::PathBuf;
 
-use anyhow::Context as _;
+use anyhow::{Context as _, bail};
 use console::style;
 use serde_json::json;
 
 use super::release::{CutRelease, cut_release, release_label, release_size};
 use super::sync::{FolderArgs, hash, require_within_limits, show_plan, upload, with_plan};
 use super::tag::LATEST;
-use crate::output::{Output, ago, print_json, table};
+use crate::output::{self, Output, ago, few, print_json, table};
 use crate::prompt::YesArg;
 use crate::target::{self, AppArg, Bucket, BucketRef, Target};
 use crate::{api, mirror, progress, theme};
@@ -148,6 +148,9 @@ pub(super) async fn sync(args: SyncArgs, output: Output) -> anyhow::Result<()> {
         (None, Some(start)) => start.source.info.limits.clone(),
         (None, None) => api::Limits::default(),
     };
+    if let Some(start) = &start {
+        require_start_within_limits(&name, start, &limits)?;
+    }
     require_within_limits(&name, &limits, &local, &plan)?;
     let applies = !dry_run && (creates || start.is_some() || !plan.is_empty());
 
@@ -410,6 +413,35 @@ async fn start_from<'a>(target: &'a Target, from: &BucketRef) -> anyhow::Result<
     })
 }
 
+/// Fails when the branch's limits refuse files of the release it starts from, which it couldn't
+/// then be promoted into.
+fn require_start_within_limits(
+    name: &BucketRef,
+    start: &Start<'_>,
+    limits: &api::Limits,
+) -> anyhow::Result<()> {
+    let refused: Vec<String> = start
+        .files
+        .iter()
+        .map(api::ReleaseFile::file)
+        .filter(|(_, version)| {
+            !(limits.fits(version.size_bytes) && limits.allows(&version.content_type))
+        })
+        .map(|(path, version)| output::file(path, &version.content_type, version.size_bytes))
+        .collect();
+    if refused.is_empty() {
+        return Ok(());
+    }
+    bail!(
+        "{name}'s limits refuse {} of the files of {} of {}: {}; cut a release there that fits \
+         first",
+        refused.len(),
+        release_label(&start.release),
+        start.source,
+        few(&refused, ", ")
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use serde_json::json;
@@ -456,8 +488,8 @@ mod tests {
         assert_eq!(ids, ["pr-3", "pr-1", "pr-2", "pr-4"]);
     }
 
-    #[tokio::test]
-    async fn a_new_branch_starts_from_the_latest_release_of_from() {
+    /// A server where staging/assets has release #2 v1.4, holding ui/logo.png.
+    async fn released() -> MockServer {
         let server = MockServer::start().await;
         let staging = "/storage/v1/apps/app_a/environments/staging/buckets";
         Mock::given(method("GET"))
@@ -491,7 +523,12 @@ mod tests {
             })))
             .mount(&server)
             .await;
+        server
+    }
 
+    #[tokio::test]
+    async fn a_new_branch_starts_from_the_latest_release_of_from() {
+        let server = released().await;
         let target = Target {
             client: api::testing::client(&server).await,
             app_id: "app_a".into(),
@@ -503,6 +540,37 @@ mod tests {
         assert_eq!(release_label(&start.release), "#2 v1.4");
         let files: Vec<&str> = start.files.iter().map(|file| file.file().0).collect();
         assert_eq!(files, ["ui/logo.png"]);
+    }
+
+    #[tokio::test]
+    async fn a_branch_can_t_start_from_a_release_its_limits_refuse() {
+        let server = released().await;
+        let target = Target {
+            client: api::testing::client(&server).await,
+            app_id: "app_a".into(),
+            app_name: "Space Shooter".into(),
+        };
+        let start = start_from(&target, &"staging/assets".parse().unwrap())
+            .await
+            .unwrap();
+        let name = branch("pr-1").unwrap();
+        let check = |max_file_size_bytes, types: Option<&str>| {
+            let limits = api::Limits {
+                max_file_size_bytes,
+                allowed_content_types: types.map(|types| vec![types.to_string()]),
+            };
+            require_start_within_limits(&name, &start, &limits)
+        };
+
+        assert!(check(None, None).is_ok());
+        assert!(check(Some(3), Some("image/*")).is_ok());
+        let refused = "branches/pr-1's limits refuse 1 of the files of #2 v1.4 of staging/assets: \
+                       ui/logo.png (image/png, 3 B); cut a release there that fits first";
+        assert_eq!(check(Some(2), None).unwrap_err().to_string(), refused);
+        assert_eq!(
+            check(None, Some("audio/*")).unwrap_err().to_string(),
+            refused
+        );
     }
 
     #[tokio::test]
