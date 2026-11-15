@@ -1,5 +1,6 @@
 //! `toaba assets bucket`: the app's buckets.
 
+use indicatif::HumanBytes;
 use serde_json::json;
 
 use crate::output::{Output, few, print_json, table};
@@ -26,6 +27,8 @@ pub(super) async fn list(args: ListArgs, output: Output) -> anyhow::Result<()> {
                     "name": bucket.name,
                     "environment": { "id": environment.id, "name": environment.name },
                     "write_access": bucket.write_access,
+                    "max_file_size_bytes": bucket.limits.max_file_size_bytes,
+                    "allowed_content_types": bucket.limits.allowed_content_types,
                     "release_count": bucket.release_count,
                     "unreleased_count": bucket.unreleased_count,
                     "tags": bucket.tags.iter().map(|tag| json!({
@@ -44,7 +47,7 @@ pub(super) async fn list(args: ListArgs, output: Output) -> anyhow::Result<()> {
         );
         return Ok(());
     }
-    let rows: Vec<[String; 5]> = buckets
+    let rows: Vec<[String; 7]> = buckets
         .iter()
         .map(|(environment, bucket)| {
             let write = match bucket.write_access.as_str() {
@@ -60,11 +63,28 @@ pub(super) async fn list(args: ListArgs, output: Output) -> anyhow::Result<()> {
                 environment.id.clone(),
                 bucket.id.clone(),
                 write,
+                match bucket.limits.max_file_size_bytes {
+                    Some(bytes) => HumanBytes(bytes).to_string(),
+                    None => "none".to_string(),
+                },
+                match &bucket.limits.allowed_content_types {
+                    Some(types) => few(types, ", "),
+                    None => "any".to_string(),
+                },
                 bucket.unreleased_count.to_string(),
                 few(&tags, ", "),
             ]
         })
         .collect();
-    table(["ENV", "BUCKET", "WRITE", "UNRELEASED", "TAGS"], &rows);
+    let headers = [
+        "ENV",
+        "BUCKET",
+        "WRITE",
+        "MAX FILE SIZE",
+        "TYPES",
+        "UNRELEASED",
+        "TAGS",
+    ];
+    table(headers, &rows);
     Ok(())
 }

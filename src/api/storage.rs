@@ -296,6 +296,8 @@ pub struct Bucket {
     pub name: String,
     /// `open`, or `promotion_only` for a bucket whose files and releases arrive only by promotion.
     pub write_access: String,
+    #[serde(flatten)]
+    pub limits: Limits,
     /// Echoed when deleting the bucket, so a change made meanwhile isn't lost unseen.
     pub revision: u64,
     pub entry_count: u64,
@@ -304,6 +306,17 @@ pub struct Bucket {
     pub unreleased_count: u64,
     /// Ordered by id. Game clients download a bucket's files by tag.
     pub tags: Vec<Tag>,
+}
+
+/// The limits a bucket sets on the files it takes.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
+pub struct Limits {
+    /// The largest file it takes, in bytes, or none for no limit.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_file_size_bytes: Option<u64>,
+    /// The content types it takes, as `type/subtype` or `type/*`, or none for any type.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allowed_content_types: Option<Vec<String>>,
 }
 
 /// A name for one of a bucket's releases, such as `latest` or `live`.
@@ -536,6 +549,41 @@ mod tests {
             .unwrap();
         let paths: Vec<&str> = found.iter().map(|entry| entry.path.as_str()).collect();
         assert_eq!(paths, ["a.txt", "ui/c.txt"]);
+    }
+
+    #[tokio::test]
+    async fn a_bucket_comes_with_its_limits_or_none() {
+        let server = MockServer::start().await;
+        let bucket = |id: &str| {
+            json!({ "id": id, "name": id, "write_access": "open", "revision": 1,
+                "entry_count": 0, "release_count": 0, "unreleased_count": 0, "tags": [] })
+        };
+        let mut limited = bucket("images");
+        limited["max_file_size_bytes"] = json!(20_971_520);
+        limited["allowed_content_types"] = json!(["image/*", "application/json"]);
+        let mut open = bucket("open");
+        open["max_file_size_bytes"] = json!(null);
+        open["allowed_content_types"] = json!(null);
+        Mock::given(method("GET"))
+            .and(path("/storage/v1/apps/app_a/environments/staging/buckets"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": [limited, open, bucket("older")],
+            })))
+            .mount(&server)
+            .await;
+
+        let buckets = client(&server)
+            .await
+            .buckets("app_a", "staging")
+            .await
+            .unwrap();
+        assert_eq!(buckets[0].limits.max_file_size_bytes, Some(20_971_520));
+        assert_eq!(
+            buckets[0].limits.allowed_content_types.as_deref(),
+            Some(["image/*".to_string(), "application/json".to_string()].as_slice())
+        );
+        assert_eq!(buckets[1].limits, super::Limits::default());
+        assert_eq!(buckets[2].limits, super::Limits::default());
     }
 
     #[tokio::test]
