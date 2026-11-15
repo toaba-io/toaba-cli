@@ -9,7 +9,7 @@ use console::style;
 use serde_json::json;
 
 use super::release::{CutRelease, cut_release, release_label, release_size};
-use super::sync::{FolderArgs, hash, show_plan, upload, with_plan};
+use super::sync::{FolderArgs, hash, require_within_limits, show_plan, upload, with_plan};
 use super::tag::LATEST;
 use crate::output::{Output, ago, print_json, table};
 use crate::prompt::YesArg;
@@ -46,7 +46,7 @@ pub struct SyncArgs {
     #[arg(value_parser = branch)]
     branch: BucketRef,
     /// Start a new branch from this bucket's latest release, as env/bucket, so only the files that
-    /// differ are uploaded
+    /// differ are uploaded, and with its limits on file size and type
     #[arg(long, value_name = "BUCKET")]
     from: Option<BucketRef>,
     /// A name for the release, such as the commit [default: the branch]
@@ -142,6 +142,13 @@ pub(super) async fn sync(args: SyncArgs, output: Output) -> anyhow::Result<()> {
         None => mirror::plan(&local, remote.iter().filter_map(api::Entry::file), delete),
     };
     let creates = existing.is_none();
+    // A new branch takes the limits of the bucket it starts from.
+    let limits = match (&existing, &start) {
+        (Some(bucket), _) => bucket.info.limits.clone(),
+        (None, Some(start)) => start.source.info.limits.clone(),
+        (None, None) => api::Limits::default(),
+    };
+    require_within_limits(&name, &limits, &local, &plan)?;
     let applies = !dry_run && (creates || start.is_some() || !plan.is_empty());
 
     let bold = |text: &str| style(text.to_string()).bold().for_stderr();
@@ -175,7 +182,7 @@ pub(super) async fn sync(args: SyncArgs, output: Output) -> anyhow::Result<()> {
             None => {
                 let bucket = progress::during(
                     "Creating the branch…",
-                    target.create_bucket(&name, ENVIRONMENT_NAME),
+                    target.create_bucket(&name, ENVIRONMENT_NAME, &limits),
                 )
                 .await?;
                 created = true;

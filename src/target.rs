@@ -111,15 +111,18 @@ impl Target {
         }
     }
 
-    /// Creates the bucket, and its environment, called `environment_name`, if the app has none by
-    /// that id. One made meanwhile, by another run of the same pipeline say, will do as well.
+    /// Creates the bucket, with these limits, and its environment, called `environment_name`, if
+    /// the app has none by that id. One made meanwhile, by another run of the same pipeline say,
+    /// will do as well.
     pub async fn create_bucket(
         &self,
         name: &BucketRef,
         environment_name: &str,
+        limits: &api::Limits,
     ) -> anyhow::Result<Bucket<'_>> {
         let (app, environment, bucket) = (&self.app_id, &name.environment_id, &name.bucket_id);
-        let created = match self.client.create_bucket(app, environment, bucket).await {
+        let create = || self.client.create_bucket(app, environment, bucket, limits);
+        let created = match create().await {
             Err(err) if api::answered(&err, "not_found") => {
                 match self
                     .client
@@ -127,7 +130,7 @@ impl Target {
                     .await
                 {
                     Err(err) if !api::answered(&err, "environment_exists") => return Err(err),
-                    _ => self.client.create_bucket(app, environment, bucket).await,
+                    _ => create().await,
                 }
             }
             created => created,
@@ -498,8 +501,44 @@ mod tests {
 
             let target = target(&server).await;
             let name: BucketRef = "branches/pr-1".parse().unwrap();
-            let created = target.create_bucket(&name, "Branches").await.unwrap();
+            let limits = api::Limits::default();
+            let created = target
+                .create_bucket(&name, "Branches", &limits)
+                .await
+                .unwrap();
             assert_eq!(created.info.id, "pr-1");
+        }
+
+        #[tokio::test]
+        async fn a_bucket_is_created_with_its_limits() {
+            let server = MockServer::start().await;
+            let mut limited = bucket();
+            limited["max_file_size_bytes"] = json!(1024);
+            limited["allowed_content_types"] = json!(["image/*"]);
+            Mock::given(method("POST"))
+                .and(path(BUCKETS))
+                .and(query_param("bucket_id", "pr-1"))
+                .and(body_json(json!({
+                    "name": "pr-1",
+                    "max_file_size_bytes": 1024,
+                    "allowed_content_types": ["image/*"],
+                })))
+                .respond_with(ResponseTemplate::new(201).set_body_json(json!({ "data": limited })))
+                .expect(1)
+                .mount(&server)
+                .await;
+
+            let target = target(&server).await;
+            let name: BucketRef = "branches/pr-1".parse().unwrap();
+            let limits = api::Limits {
+                max_file_size_bytes: Some(1024),
+                allowed_content_types: Some(vec!["image/*".into()]),
+            };
+            let created = target
+                .create_bucket(&name, "Branches", &limits)
+                .await
+                .unwrap();
+            assert_eq!(created.info.limits, limits);
         }
 
         #[tokio::test]
@@ -526,7 +565,11 @@ mod tests {
 
             let target = target(&server).await;
             let name: BucketRef = "branches/pr-1".parse().unwrap();
-            let found = target.create_bucket(&name, "Branches").await.unwrap();
+            let limits = api::Limits::default();
+            let found = target
+                .create_bucket(&name, "Branches", &limits)
+                .await
+                .unwrap();
             assert_eq!(found.to_string(), "branches/pr-1");
         }
 
@@ -541,7 +584,8 @@ mod tests {
 
             let target = target(&server).await;
             let name: BucketRef = "branches/pr-1".parse().unwrap();
-            let Err(err) = target.create_bucket(&name, "Branches").await else {
+            let limits = api::Limits::default();
+            let Err(err) = target.create_bucket(&name, "Branches", &limits).await else {
                 panic!("a full environment takes no bucket");
             };
             assert_eq!(

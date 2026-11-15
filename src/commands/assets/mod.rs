@@ -54,9 +54,9 @@ pub enum BranchCommand {
     ///
     /// The bucket is branches/<branch>, created the first time with the environment.
     /// With --from, a new branch starts from that bucket's latest release, so only
-    /// the files that differ are uploaded. Files only in the bucket stay, as with
-    /// `assets sync`; --delete removes them. Each sync cuts a release, which the
-    /// bucket's latest tag follows. Run it again on every push.
+    /// the files that differ are uploaded, and takes its limits. Files only in the
+    /// bucket stay, as with `assets sync`; --delete removes them. Each sync cuts a
+    /// release, which the bucket's latest tag follows. Run it again on every push.
     Sync(branch::SyncArgs),
     /// List the branches, the most recently released first
     #[command(visible_alias = "ls")]

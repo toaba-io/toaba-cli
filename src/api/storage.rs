@@ -40,19 +40,29 @@ impl Client {
         .await
     }
 
-    /// Creates an open bucket with this id, named after it. One that exists already answers
-    /// `bucket_exists`, and a missing environment `not_found`.
+    /// Creates an open bucket with this id, named after it, with these limits. One that exists
+    /// already answers `bucket_exists`, and a missing environment `not_found`.
     pub async fn create_bucket(
         &self,
         app_id: &str,
         environment_id: &str,
         bucket_id: &str,
+        limits: &Limits,
     ) -> anyhow::Result<Bucket> {
+        #[derive(Serialize)]
+        struct NewBucket<'a> {
+            name: &'a str,
+            #[serde(flatten)]
+            limits: &'a Limits,
+        }
         self.post(
             &format!(
                 "/storage/v1/apps/{app_id}/environments/{environment_id}/buckets?bucket_id={bucket_id}"
             ),
-            &serde_json::json!({ "name": bucket_id }),
+            &NewBucket {
+                name: bucket_id,
+                limits,
+            },
         )
         .await
     }
