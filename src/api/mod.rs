@@ -295,6 +295,14 @@ struct ErrorBody {
     extra: BTreeMap<String, serde_json::Value>,
 }
 
+/// A file that `outside_bucket_limits` lists.
+#[derive(Deserialize)]
+struct RefusedFile {
+    path: String,
+    size_bytes: u64,
+    content_type: String,
+}
+
 impl Error {
     async fn read(response: Response) -> Self {
         let status = response.status();
@@ -326,6 +334,35 @@ impl Error {
 
     pub fn is(&self, code: &str) -> bool {
         self.code.as_deref() == Some(code)
+    }
+
+    /// The wording of `outside_bucket_limits`, naming the files it lists.
+    fn outside_bucket_limits(&self) -> String {
+        let files = self
+            .extra
+            .get("files")
+            .and_then(|files| Vec::<RefusedFile>::deserialize(files).ok())
+            .unwrap_or_default();
+        let refuse = "the target bucket's limits refuse";
+        if files.is_empty() {
+            return format!("{refuse} some of the release's files");
+        }
+        let named: Vec<String> = files
+            .iter()
+            .map(|file| {
+                format!(
+                    "{} ({}, {})",
+                    crate::output::plain(&file.path),
+                    crate::output::plain(&file.content_type),
+                    HumanBytes(file.size_bytes)
+                )
+            })
+            .collect();
+        format!(
+            "{refuse} {} of the release's files: {}",
+            named.len(),
+            crate::output::few(&named, ", ")
+        )
     }
 }
 
@@ -378,6 +415,7 @@ impl fmt::Display for Error {
                     _ => f.write_str("the org's storage is full"),
                 }
             }
+            Some("outside_bucket_limits") => f.write_str(&self.outside_bucket_limits()),
             Some("stale_bucket") => {
                 f.write_str("the bucket changed meanwhile, run the command again")
             }

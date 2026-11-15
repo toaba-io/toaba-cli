@@ -774,6 +774,46 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_promotion_outside_the_target_s_limits_names_the_files() {
+        let server = MockServer::start().await;
+        let file = |path: &str, size_bytes: u64, content_type: &str| json!({ "path": path, "size_bytes": size_bytes, "content_type": content_type });
+        Mock::given(method("POST"))
+            .and(path(
+                "/storage/v1/apps/app_a/environments/staging/buckets/assets/releases/r9/promote",
+            ))
+            .respond_with(ResponseTemplate::new(409).set_body_json(json!({
+                "error": "outside_bucket_limits",
+                "files": [
+                    file("art/hero.psd", 3 * 1024 * 1024, "image/vnd.adobe.photoshop"),
+                    file("levels/big.bundle", 2 * 1024 * 1024 * 1024, "application/octet-stream"),
+                ],
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let promotion = super::Promotion {
+            target_environment_id: "production",
+            target_bucket_id: "assets",
+            name: None,
+            notes: None,
+            tags: Vec::new(),
+        };
+        let err = client(&server)
+            .await
+            .bucket("app_a", "staging", "assets")
+            .promote("r9", &promotion)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "the target bucket's limits refuse 2 of the release's files: \
+             art/hero.psd (image/vnd.adobe.photoshop, 3.00 MiB), levels/big.bundle \
+             (application/octet-stream, 2.00 GiB)"
+        );
+    }
+
+    #[tokio::test]
     async fn a_bucket_is_deleted_with_its_contents_at_the_revision_read() {
         let server = MockServer::start().await;
         let bucket = "/storage/v1/apps/app_a/environments/branches/buckets/pr-1";
