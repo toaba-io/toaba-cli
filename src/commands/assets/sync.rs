@@ -3,6 +3,7 @@
 
 use std::path::PathBuf;
 
+use anyhow::bail;
 use console::style;
 use indicatif::HumanBytes;
 use serde_json::json;
@@ -87,6 +88,7 @@ pub(super) async fn run(args: Args, output: Output) -> anyhow::Result<()> {
 
     let local = hash(files).await?;
     let plan = mirror::plan(&local, remote.iter().filter_map(api::Entry::file), delete);
+    require_within_limits(&bucket.name, &bucket.info.limits, &local, &plan)?;
     let applies = !dry_run && !plan.is_empty();
     show_plan(&plan, output, applies && !yes.yes);
 
@@ -178,6 +180,88 @@ pub(super) async fn hash(
     Ok(local)
 }
 
+/// Fails when the bucket's limits refuse files the plan uploads, after listing them on stderr.
+pub(super) fn require_within_limits(
+    bucket: &BucketRef,
+    limits: &api::Limits,
+    local: &[mirror::LocalFile],
+    plan: &mirror::Plan,
+) -> anyhow::Result<()> {
+    let refused = mirror::refused(local, plan, limits);
+    if refused.is_empty() {
+        return Ok(());
+    }
+    let too_big = refused
+        .iter()
+        .filter(|file| !limits.fits(file.size_bytes))
+        .map(|file| (file.path.as_str(), HumanBytes(file.size_bytes).to_string()))
+        .collect();
+    let wrong_type: Vec<(&str, String)> = refused
+        .iter()
+        .filter(|file| !limits.allows(&file.content_type))
+        .map(|file| (file.path.as_str(), file.content_type.clone()))
+        .collect();
+    let over = limits
+        .max_file_size_bytes
+        .map(|max| format!("over {}", HumanBytes(max)))
+        .unwrap_or_default();
+    let groups = [
+        (too_big, over),
+        (wrong_type, "not an allowed type".to_string()),
+    ];
+    eprint!("{}", refused_text(&groups));
+    bail!("{bucket}'s limits refuse {} of the files", refused.len())
+}
+
+/// The refused files, a line each: for each reason, its files' paths with their size or type.
+fn refused_text(groups: &[(Vec<(&str, String)>, String)]) -> String {
+    let mark = theme::failure().apply_to("✗").to_string();
+    let dim = |text: &str| style(text).dim().for_stderr().to_string();
+    let listed = || {
+        groups
+            .iter()
+            .flat_map(|(files, _)| files.iter().take(LISTED))
+    };
+    let path_width = width("", listed().map(|(path, _)| path));
+    let detail_width = width("", listed().map(|(_, detail)| detail));
+    groups
+        .iter()
+        .map(|(files, what)| {
+            let rows: Vec<String> = files
+                .iter()
+                .take(LISTED)
+                .map(|(path, detail)| {
+                    format!(
+                        "{}  {}",
+                        pad(&plain(path), path_width),
+                        pad(detail, detail_width)
+                    )
+                })
+                .collect();
+            listing(&mark, &rows, files.len(), what, &dim)
+        })
+        .collect()
+}
+
+/// A line for each row, ending in `what`, then how many of the `total` aren't among them.
+fn listing(
+    mark: &str,
+    rows: &[String],
+    total: usize,
+    what: &str,
+    dim: &dyn Fn(&str) -> String,
+) -> String {
+    let mut text = String::new();
+    for row in rows {
+        text.push_str(&format!("  {mark} {row}  {}\n", dim(what)));
+    }
+    if total > rows.len() {
+        let more = format!("… and {} more {what}", total - rows.len());
+        text.push_str(&format!("  {mark} {}\n", dim(&more)));
+    }
+    text
+}
+
 /// Shows the plan: on stdout as the result, or with -o json on stderr, for the person `asking`.
 pub(super) fn show_plan(plan: &mirror::Plan, output: Output, asking: bool) {
     if output == Output::Text {
@@ -258,18 +342,18 @@ fn plan_text(plan: &mirror::Plan, stdout: bool) -> String {
 
     let mut text = String::new();
     for (mark, changes, what) in &groups {
-        for change in changes.iter().take(LISTED) {
-            text.push_str(&format!(
-                "  {mark} {}  {:>size_width$}  {}\n",
-                pad(&plain(&change.path), path_width),
-                HumanBytes(change.size_bytes).to_string(),
-                dim(what)
-            ));
-        }
-        if changes.len() > LISTED {
-            let more = format!("… and {} more {what}", changes.len() - LISTED);
-            text.push_str(&format!("  {mark} {}\n", dim(&more)));
-        }
+        let rows: Vec<String> = changes
+            .iter()
+            .take(LISTED)
+            .map(|change| {
+                format!(
+                    "{}  {:>size_width$}",
+                    pad(&plain(&change.path), path_width),
+                    HumanBytes(change.size_bytes).to_string()
+                )
+            })
+            .collect();
+        text.push_str(&listing(mark, &rows, changes.len(), what, &dim));
     }
     // Removed and kept files are counted only when there are some. Kept files are never listed:
     // a bucket gathers old bundles over time.
@@ -325,6 +409,67 @@ mod tests {
         assert_eq!(text.matches("to remove\n").count(), 3);
         assert!(text.contains("25 new, 0 changed, 3 to remove, 0 unchanged ·"));
         assert!(!text.contains("--delete"));
+    }
+
+    #[test]
+    fn files_outside_the_bucket_s_limits_stop_the_sync_before_it_uploads() {
+        let file = |path: &str, size_bytes: u64, content_type: &str| mirror::LocalFile {
+            path: path.into(),
+            source: path.into(),
+            size_bytes,
+            sha256: "aa".into(),
+            content_type: content_type.into(),
+        };
+        let mut local = vec![
+            file("hero.psd", 3 * 1024 * 1024, "image/vnd.adobe.photoshop"),
+            file("logo.png", 1024, "image/png"),
+            file("notes.txt", 10, "text/plain"),
+        ];
+        local.extend(
+            (0..LISTED + 2).map(|n| file(&format!("z-{n:02}.png"), 2 * 1024 * 1024, "image/png")),
+        );
+        let plan = mirror::plan(&local, [], false);
+        let limits = api::Limits {
+            max_file_size_bytes: Some(1024 * 1024),
+            allowed_content_types: Some(vec!["image/png".into(), "audio/*".into()]),
+        };
+        let bucket: BucketRef = "staging/android".parse().unwrap();
+
+        let sizes: Vec<String> = (0..LISTED + 3).map(|n| format!("z-{n:02}.png")).collect();
+        let groups = [
+            (
+                sizes
+                    .iter()
+                    .map(|path| (path.as_str(), "2.00 MiB".to_string()))
+                    .collect(),
+                "over 1.00 MiB".to_string(),
+            ),
+            (
+                vec![("hero.psd", "image/vnd.adobe.photoshop".to_string())],
+                "not an allowed type".to_string(),
+            ),
+        ];
+        let text = refused_text(&groups);
+        let text = console::strip_ansi_codes(&text);
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines.len(), LISTED + 1 + 1);
+        assert_eq!(
+            lines[0],
+            "  ✗ z-00.png  2.00 MiB                   over 1.00 MiB"
+        );
+        assert_eq!(lines[LISTED], "  ✗ … and 3 more over 1.00 MiB");
+        assert_eq!(
+            lines[LISTED + 1],
+            "  ✗ hero.psd  image/vnd.adobe.photoshop  not an allowed type"
+        );
+
+        let err = require_within_limits(&bucket, &limits, &local, &plan).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "staging/android's limits refuse 24 of the files"
+        );
+        assert!(require_within_limits(&bucket, &api::Limits::default(), &local, &plan).is_ok());
+        assert!(require_within_limits(&bucket, &limits, &local[1..2], &plan).is_ok());
     }
 
     #[test]

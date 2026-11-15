@@ -219,6 +219,32 @@ pub fn plan<'a>(
     plan
 }
 
+/// The local files the plan uploads: its new and changed ones, by path.
+fn uploads<'a>(local: &'a [LocalFile], plan: &Plan) -> Vec<&'a LocalFile> {
+    let wanted: BTreeSet<&str> = plan
+        .new
+        .iter()
+        .chain(&plan.changed)
+        .map(|change| change.path.as_str())
+        .collect();
+    local
+        .iter()
+        .filter(|file| wanted.contains(file.path.as_str()))
+        .collect()
+}
+
+/// The files the plan uploads that the bucket's limits refuse, by path.
+pub fn refused<'a>(
+    local: &'a [LocalFile],
+    plan: &Plan,
+    limits: &api::Limits,
+) -> Vec<&'a LocalFile> {
+    uploads(local, plan)
+        .into_iter()
+        .filter(|file| !(limits.fits(file.size_bytes) && limits.allows(&file.content_type)))
+        .collect()
+}
+
 /// How many files one `prepare` asks about, and how many bytes at most: every PUT must start
 /// within five minutes of it, so a batch has to stay small enough to get through in time.
 const BATCH_FILES: usize = 200;
@@ -241,16 +267,7 @@ pub async fn apply(
     concurrency: usize,
     bar: &ProgressBar,
 ) -> anyhow::Result<()> {
-    let wanted: BTreeSet<&str> = plan
-        .new
-        .iter()
-        .chain(&plan.changed)
-        .map(|change| change.path.as_str())
-        .collect();
-    let uploads: Vec<&LocalFile> = local
-        .iter()
-        .filter(|file| wanted.contains(file.path.as_str()))
-        .collect();
+    let uploads = uploads(local, plan);
 
     // The tokens of uploads prepared and not yet completed, to cancel if the sync stops.
     let unfinished: Mutex<Vec<String>> = Mutex::new(Vec::new());
@@ -326,10 +343,10 @@ async fn upload_all(
             })
             .collect();
         let prepared = bucket.prepare_uploads(&items).await.map_err(|err| {
-            let too_big = err
+            let refusal = err
                 .downcast_ref::<api::Error>()
-                .and_then(|refused| too_big(&refused.fields, &batch));
-            match too_big {
+                .and_then(|refused| refusal(&refused.fields, &batch));
+            match refusal {
                 Some(message) => anyhow::anyhow!(message),
                 None => err,
             }
@@ -403,39 +420,76 @@ async fn upload_all(
     Ok(())
 }
 
-/// Says which files are over the org's file size limit, when that's why the API refused a batch.
-/// It names them by their place in the batch, as `items.3.size_bytes`, with the limit in bytes.
-fn too_big(fields: &BTreeMap<String, Vec<String>>, batch: &[&LocalFile]) -> Option<String> {
+/// Says which files are too big or of a type the bucket doesn't take, when that's why the API
+/// refused a batch. It names them by their place in the batch, as `items.3.size_bytes`.
+fn refusal(fields: &BTreeMap<String, Vec<String>>, batch: &[&LocalFile]) -> Option<String> {
     let mut limit = None;
-    let mut files = Vec::new();
+    let (mut too_big, mut wrong_type) = (Vec::new(), Vec::new());
     for (field, messages) in fields {
-        let Some(index) = field
+        let Some((index, what)) = field
             .strip_prefix("items.")
-            .and_then(|rest| rest.strip_suffix(".size_bytes"))
-            .and_then(|index| index.parse::<usize>().ok())
+            .and_then(|rest| rest.split_once('.'))
         else {
             continue;
         };
-        let file = batch.get(index)?;
-        files.push(format!("{} ({})", file.path, HumanBytes(file.size_bytes)));
-        limit = limit.or_else(|| {
-            let digits: String = messages
-                .iter()
-                .flat_map(|message| message.chars())
-                .skip_while(|c| !c.is_ascii_digit())
-                .take_while(char::is_ascii_digit)
-                .collect();
-            digits.parse::<u64>().ok()
-        });
+        let Ok(index) = index.parse::<usize>() else {
+            continue;
+        };
+        match what {
+            "size_bytes" => {
+                let file = batch.get(index)?;
+                too_big.push(format!("{} ({})", file.path, HumanBytes(file.size_bytes)));
+                limit = limit.or_else(|| messages.first().map(|message| size_limit(message)));
+            }
+            "content_type" => {
+                let file = batch.get(index)?;
+                wrong_type.push(format!("{} ({})", file.path, file.content_type));
+            }
+            _ => {}
+        }
     }
-    let limit = match limit {
-        Some(bytes) => format!("the org's {} file size limit", HumanBytes(bytes)),
-        None => "the org's file size limit".to_string(),
+    let limit = limit.unwrap_or_else(|| "the file size limit".to_string());
+    let refusals: Vec<String> = [
+        are(&too_big, &format!("over {limit}")),
+        are(&wrong_type, "of a type the bucket doesn't take"),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
+    (!refusals.is_empty()).then(|| refusals.join("; "))
+}
+
+/// `a is what`, or `3 files are what: a, b, c`, or nothing without files.
+fn are(files: &[String], what: &str) -> Option<String> {
+    match files {
+        [] => None,
+        [file] => Some(format!("{file} is {what}")),
+        _ => Some(format!(
+            "{} files are {what}: {}",
+            files.len(),
+            few(files, ", ")
+        )),
+    }
+}
+
+/// The file size limit a refusal's message names, with whose it is: the bucket's or the org's.
+/// The message reads `must be at most 536870912 bytes, the bucket's file size limit`.
+fn size_limit(message: &str) -> String {
+    let whose = if message.contains("bucket's") {
+        "the bucket's"
+    } else if message.contains("organization's") {
+        "the org's"
+    } else {
+        "the"
     };
-    match files.len() {
-        0 => None,
-        1 => Some(format!("{} is over {limit}", files[0])),
-        n => Some(format!("{n} files are over {limit}: {}", few(&files, ", "))),
+    let digits: String = message
+        .chars()
+        .skip_while(|c| !c.is_ascii_digit())
+        .take_while(char::is_ascii_digit)
+        .collect();
+    match digits.parse::<u64>() {
+        Ok(bytes) => format!("{whose} {} file size limit", HumanBytes(bytes)),
+        Err(_) => format!("{whose} file size limit"),
     }
 }
 
@@ -602,30 +656,82 @@ mod tests {
     }
 
     #[test]
-    fn a_refusal_for_size_names_the_files_and_the_limit() {
+    fn the_files_a_bucket_s_limits_refuse_are_those_the_plan_uploads() {
+        let sized = |path: &str, size_bytes: u64, content_type: &str| LocalFile {
+            size_bytes,
+            ..local(path, "aa", content_type)
+        };
+        let local = [
+            sized("big.png", 30, "image/png"),
+            sized("huge.psd", 40, "image/vnd.adobe.photoshop"),
+            sized("notes.txt", 5, "text/plain"),
+            sized("ok.png", 20, "image/png"),
+            // In the bucket already, unchanged, so not uploaded.
+            sized("old.png", 50, "image/png"),
+        ];
+        let remote = [remote("old.png", "aa", "image/png")];
+        let plan = plan(&local, remote.iter().filter_map(api::Entry::file), false);
+        let limits = api::Limits {
+            max_file_size_bytes: Some(20),
+            allowed_content_types: Some(vec!["image/png".into(), "audio/*".into()]),
+        };
+        let paths = |limits: &api::Limits| -> Vec<&str> {
+            let refused = refused(&local, &plan, limits);
+            refused.iter().map(|file| file.path.as_str()).collect()
+        };
+
+        assert_eq!(paths(&limits), ["big.png", "huge.psd", "notes.txt"]);
+        assert!(paths(&api::Limits::default()).is_empty());
+    }
+
+    #[test]
+    fn a_refusal_for_size_or_type_names_the_files_and_whose_limit_it_is() {
         let small = local("small.txt", "aa", "text/plain");
         let big = LocalFile {
             path: "big.bin".into(),
             size_bytes: 2 * 1024 * 1024 * 1024,
+            content_type: "application/octet-stream".into(),
             ..small.clone()
         };
         let batch = [&small, &big];
-        let refused = |field: &str| {
-            BTreeMap::from([(
-                field.to_string(),
-                vec![
-                    "must be at most 536870912 bytes, the organization's file size limit"
-                        .to_string(),
-                ],
-            )])
+        let refused = |fields: &[(&str, &str)]| -> BTreeMap<String, Vec<String>> {
+            fields
+                .iter()
+                .map(|(field, message)| (field.to_string(), vec![message.to_string()]))
+                .collect()
         };
+        let orgs = "must be at most 536870912 bytes, the organization's file size limit";
+        let buckets = "must be at most 1048576 bytes, the bucket's file size limit";
+        let not_allowed = "isn't allowed in this bucket";
 
         assert_eq!(
-            too_big(&refused("items.1.size_bytes"), &batch).unwrap(),
+            refusal(&refused(&[("items.1.size_bytes", orgs)]), &batch).unwrap(),
             "big.bin (2.00 GiB) is over the org's 512.00 MiB file size limit"
         );
-        assert_eq!(too_big(&refused("items.1.path"), &batch), None);
-        assert_eq!(too_big(&refused("items.7.size_bytes"), &batch), None);
+        assert_eq!(
+            refusal(&refused(&[("items.1.size_bytes", buckets)]), &batch).unwrap(),
+            "big.bin (2.00 GiB) is over the bucket's 1.00 MiB file size limit"
+        );
+        assert_eq!(
+            refusal(
+                &refused(&[
+                    ("items.0.content_type", not_allowed),
+                    ("items.1.content_type", not_allowed),
+                    ("items.1.size_bytes", buckets),
+                ]),
+                &batch
+            )
+            .unwrap(),
+            "big.bin (2.00 GiB) is over the bucket's 1.00 MiB file size limit; 2 files are of a \
+             type the bucket doesn't take: small.txt (text/plain), big.bin \
+             (application/octet-stream)"
+        );
+        for other in [
+            ("items.1.path", "can't be blank"),
+            ("items.7.size_bytes", orgs),
+        ] {
+            assert_eq!(refusal(&refused(&[other]), &batch), None);
+        }
     }
 
     #[tokio::test]

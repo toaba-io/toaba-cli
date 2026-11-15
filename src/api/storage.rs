@@ -5,6 +5,7 @@ use std::collections::BTreeMap;
 
 use anyhow::Context as _;
 use chrono::{DateTime, Utc};
+use mime_guess::Mime;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
@@ -319,6 +320,27 @@ pub struct Limits {
     pub allowed_content_types: Option<Vec<String>>,
 }
 
+impl Limits {
+    /// Whether a file of this size is within the limit.
+    pub fn fits(&self, size_bytes: u64) -> bool {
+        self.max_file_size_bytes.is_none_or(|max| size_bytes <= max)
+    }
+
+    /// Whether this content type, without its parameters, is among the types the bucket takes.
+    pub fn allows(&self, content_type: &str) -> bool {
+        let Some(allowed) = &self.allowed_content_types else {
+            return true;
+        };
+        let Ok(mime) = content_type.parse::<Mime>() else {
+            return false;
+        };
+        let whole = format!("{}/*", mime.type_());
+        allowed
+            .iter()
+            .any(|entry| entry == mime.essence_str() || *entry == whole)
+    }
+}
+
 /// A name for one of a bucket's releases, such as `latest` or `live`.
 #[derive(Debug, Deserialize, Serialize)]
 pub struct Tag {
@@ -584,6 +606,26 @@ mod tests {
         );
         assert_eq!(buckets[1].limits, super::Limits::default());
         assert_eq!(buckets[2].limits, super::Limits::default());
+    }
+
+    #[test]
+    fn a_bucket_takes_the_types_it_lists_whole_or_by_subtype_and_sizes_up_to_its_limit() {
+        let limits = super::Limits {
+            max_file_size_bytes: Some(10),
+            allowed_content_types: Some(vec!["image/*".into(), "application/json".into()]),
+        };
+        for allowed in ["image/png", "IMAGE/Png", "application/json; charset=utf-8"] {
+            assert!(limits.allows(allowed), "{allowed}");
+        }
+        for refused in ["application/octet-stream", "text/json", "image", ""] {
+            assert!(!limits.allows(refused), "{refused}");
+        }
+        assert!(limits.fits(10));
+        assert!(!limits.fits(11));
+
+        let open = super::Limits::default();
+        assert!(open.allows("application/octet-stream"));
+        assert!(open.fits(u64::MAX));
     }
 
     #[tokio::test]
