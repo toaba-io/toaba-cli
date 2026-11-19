@@ -578,7 +578,7 @@ mod tests {
             let server = MockServer::start().await;
             Mock::given(method("POST"))
                 .and(path(BUCKETS))
-                .respond_with(refused(409, "too_many_buckets"))
+                .respond_with(refused(429, "too_many_buckets"))
                 .mount(&server)
                 .await;
 

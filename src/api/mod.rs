@@ -257,7 +257,12 @@ struct Data<T> {
 #[derive(Deserialize)]
 struct Page<T> {
     data: Vec<T>,
+    #[serde(default, deserialize_with = "token")]
     next_page_token: Option<String>,
+}
+
+fn token<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<Option<String>, D::Error> {
+    Ok(Option::<String>::deserialize(deserializer)?.filter(|token| !token.is_empty()))
 }
 
 /// The API refused the token, or Toaba ended the login: the token is unknown, expired or revoked.
@@ -557,7 +562,7 @@ mod tests {
     async fn validation_errors_name_their_fields() {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
-            .respond_with(ResponseTemplate::new(422).set_body_json(json!({
+            .respond_with(ResponseTemplate::new(400).set_body_json(json!({
                 "error": "validation_failed",
                 "errors": { "name": ["can't be blank"] }
             })))

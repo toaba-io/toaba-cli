@@ -568,7 +568,7 @@ mod tests {
             .and(query_param("recursive", "true"))
             .and(query_param("page_token", "more"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                "data": [entry("2", "ui/c.txt")], "folders": [], "next_page_token": null,
+                "data": [entry("2", "ui/c.txt")], "folders": [], "next_page_token": "",
             })))
             .mount(&server)
             .await;
@@ -704,7 +704,7 @@ mod tests {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .respond_with(
-                ResponseTemplate::new(409).set_body_json(json!({ "error": "promotion_only" })),
+                ResponseTemplate::new(400).set_body_json(json!({ "error": "promotion_only" })),
             )
             .expect(1)
             .mount(&server)
@@ -781,7 +781,7 @@ mod tests {
             .and(path(
                 "/storage/v1/apps/app_a/environments/staging/buckets/assets/releases/r9/promote",
             ))
-            .respond_with(ResponseTemplate::new(409).set_body_json(json!({
+            .respond_with(ResponseTemplate::new(400).set_body_json(json!({
                 "error": "outside_bucket_limits",
                 "files": [
                     file("art/hero.psd", 3 * 1024 * 1024, "image/vnd.adobe.photoshop"),
@@ -865,7 +865,7 @@ mod tests {
             .and(path(releases))
             .and(query_param("page_token", "more"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                "data": [release(3), release(1)], "next_page_token": null,
+                "data": [release(3), release(1)], "next_page_token": "",
             })))
             .mount(&server)
             .await;
