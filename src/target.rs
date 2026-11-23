@@ -111,17 +111,21 @@ impl Target {
         }
     }
 
-    /// Creates the bucket, with these limits, and its environment, called `environment_name`, if
-    /// the app has none by that id. One made meanwhile, by another run of the same pipeline say,
-    /// will do as well.
+    /// Creates the bucket, with these limits and privacy, and its environment, called
+    /// `environment_name`, if the app has none by that id. One made meanwhile, by another run of
+    /// the same pipeline say, will do as well.
     pub async fn create_bucket(
         &self,
         name: &BucketRef,
         environment_name: &str,
         limits: &api::Limits,
+        private: bool,
     ) -> anyhow::Result<Bucket<'_>> {
         let (app, environment, bucket) = (&self.app_id, &name.environment_id, &name.bucket_id);
-        let create = || self.client.create_bucket(app, environment, bucket, limits);
+        let create = || {
+            self.client
+                .create_bucket(app, environment, bucket, limits, private)
+        };
         let created = match create().await {
             Err(err) if api::answered(&err, "not_found") => {
                 match self
@@ -463,7 +467,7 @@ mod tests {
         }
 
         fn bucket() -> serde_json::Value {
-            json!({ "id": "pr-1", "name": "pr-1", "write_access": "open", "revision": 1, "entry_count": 0, "release_count": 0,
+            json!({ "id": "pr-1", "name": "pr-1", "write_access": "open", "private": false, "revision": 1, "entry_count": 0, "release_count": 0,
                 "unreleased_count": 0, "tags": [] })
         }
 
@@ -503,23 +507,25 @@ mod tests {
             let name: BucketRef = "branches/pr-1".parse().unwrap();
             let limits = api::Limits::default();
             let created = target
-                .create_bucket(&name, "Branches", &limits)
+                .create_bucket(&name, "Branches", &limits, false)
                 .await
                 .unwrap();
             assert_eq!(created.info.id, "pr-1");
         }
 
         #[tokio::test]
-        async fn a_bucket_is_created_with_its_limits() {
+        async fn a_bucket_is_created_with_its_limits_and_privacy() {
             let server = MockServer::start().await;
             let mut limited = bucket();
             limited["max_file_size_bytes"] = json!(1024);
             limited["allowed_content_types"] = json!(["image/*"]);
+            limited["private"] = json!(true);
             Mock::given(method("POST"))
                 .and(path(BUCKETS))
                 .and(query_param("bucket_id", "pr-1"))
                 .and(body_json(json!({
                     "name": "pr-1",
+                    "private": true,
                     "max_file_size_bytes": 1024,
                     "allowed_content_types": ["image/*"],
                 })))
@@ -535,10 +541,11 @@ mod tests {
                 allowed_content_types: Some(vec!["image/*".into()]),
             };
             let created = target
-                .create_bucket(&name, "Branches", &limits)
+                .create_bucket(&name, "Branches", &limits, true)
                 .await
                 .unwrap();
             assert_eq!(created.info.limits, limits);
+            assert!(created.info.private);
         }
 
         #[tokio::test]
@@ -567,7 +574,7 @@ mod tests {
             let name: BucketRef = "branches/pr-1".parse().unwrap();
             let limits = api::Limits::default();
             let found = target
-                .create_bucket(&name, "Branches", &limits)
+                .create_bucket(&name, "Branches", &limits, false)
                 .await
                 .unwrap();
             assert_eq!(found.to_string(), "branches/pr-1");
@@ -585,7 +592,10 @@ mod tests {
             let target = target(&server).await;
             let name: BucketRef = "branches/pr-1".parse().unwrap();
             let limits = api::Limits::default();
-            let Err(err) = target.create_bucket(&name, "Branches", &limits).await else {
+            let Err(err) = target
+                .create_bucket(&name, "Branches", &limits, false)
+                .await
+            else {
                 panic!("a full environment takes no bucket");
             };
             assert_eq!(

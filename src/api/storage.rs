@@ -40,18 +40,21 @@ impl Client {
         .await
     }
 
-    /// Creates an open bucket with this id, named after it, with these limits. One that exists
-    /// already answers `bucket_exists`, and a missing environment `not_found`.
+    /// Creates an open bucket with this id, named after it, with these limits and privacy. One
+    /// that exists already answers `bucket_exists`, and a missing environment `not_found`.
     pub async fn create_bucket(
         &self,
         app_id: &str,
         environment_id: &str,
         bucket_id: &str,
         limits: &Limits,
+        private: bool,
     ) -> anyhow::Result<Bucket> {
         #[derive(Serialize)]
         struct NewBucket<'a> {
             name: &'a str,
+            #[serde(skip_serializing_if = "std::ops::Not::not")]
+            private: bool,
             #[serde(flatten)]
             limits: &'a Limits,
         }
@@ -61,6 +64,7 @@ impl Client {
             ),
             &NewBucket {
                 name: bucket_id,
+                private,
                 limits,
             },
         )
@@ -307,6 +311,8 @@ pub struct Bucket {
     pub name: String,
     /// `open`, or `promotion_only` for a bucket whose files and releases arrive only by promotion.
     pub write_access: String,
+    /// Whether game clients need a bucket token to read its files.
+    pub private: bool,
     #[serde(flatten)]
     pub limits: Limits,
     /// Echoed when deleting the bucket, so a change made meanwhile isn't lost unseen.
@@ -587,7 +593,7 @@ mod tests {
     async fn a_bucket_comes_with_its_limits_or_none() {
         let server = MockServer::start().await;
         let bucket = |id: &str| {
-            json!({ "id": id, "name": id, "write_access": "open", "revision": 1,
+            json!({ "id": id, "name": id, "write_access": "open", "private": false, "revision": 1,
                 "entry_count": 0, "release_count": 0, "unreleased_count": 0, "tags": [] })
         };
         let mut limited = bucket("images");

@@ -142,11 +142,11 @@ pub(super) async fn sync(args: SyncArgs, output: Output) -> anyhow::Result<()> {
         None => mirror::plan(&local, remote.iter().filter_map(api::Entry::file), delete),
     };
     let creates = existing.is_none();
-    // A new branch takes the limits of the bucket it starts from.
-    let limits = match (&existing, &start) {
-        (Some(bucket), _) => bucket.info.limits.clone(),
-        (None, Some(start)) => start.source.info.limits.clone(),
-        (None, None) => api::Limits::default(),
+    // A new branch takes the limits and privacy of the bucket it starts from.
+    let (limits, private) = match (&existing, &start) {
+        (Some(bucket), _) => (bucket.info.limits.clone(), bucket.info.private),
+        (None, Some(start)) => (start.source.info.limits.clone(), start.source.info.private),
+        (None, None) => (api::Limits::default(), false),
     };
     if let Some(start) = &start {
         require_start_within_limits(&name, start, &limits)?;
@@ -185,7 +185,7 @@ pub(super) async fn sync(args: SyncArgs, output: Output) -> anyhow::Result<()> {
             None => {
                 let bucket = progress::during(
                     "Creating the branch…",
-                    target.create_bucket(&name, ENVIRONMENT_NAME, &limits),
+                    target.create_bucket(&name, ENVIRONMENT_NAME, &limits, private),
                 )
                 .await?;
                 created = true;
@@ -194,6 +194,12 @@ pub(super) async fn sync(args: SyncArgs, output: Output) -> anyhow::Result<()> {
                     theme::accent().apply_to("✓"),
                     bold(&name.to_string())
                 );
+                if private {
+                    eprintln!(
+                        "  It's private: game clients need a bucket token to read it, and a new \
+                         branch has none. Create one in the dashboard."
+                    );
+                }
                 bucket
             }
         };
@@ -472,9 +478,11 @@ mod tests {
                     "previous_release": null, "revision": 1, "update_time": time }]),
                 None => json!([]),
             };
-            serde_json::from_value(json!({ "id": id, "name": id, "write_access": "open",
+            serde_json::from_value(
+                json!({ "id": id, "name": id, "write_access": "open", "private": false,
                 "revision": 1, "entry_count": 0, "release_count": 1, "unreleased_count": 0,
-                "tags": tags }))
+                "tags": tags }),
+            )
             .unwrap()
         };
         let mut branches = [
@@ -495,7 +503,7 @@ mod tests {
         Mock::given(method("GET"))
             .and(path(staging))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "data": [{
-                "id": "assets", "name": "Assets", "write_access": "open", "revision": 1, "entry_count": 0, "release_count": 2,
+                "id": "assets", "name": "Assets", "write_access": "open", "private": false, "revision": 1, "entry_count": 0, "release_count": 2,
                 "unreleased_count": 0,
                 "tags": [{ "id": "latest", "release": { "id": "r2", "release_num": 2 },
                     "previous_release": null, "revision": 2,
@@ -579,7 +587,7 @@ mod tests {
         Mock::given(method("GET"))
             .and(path("/storage/v1/apps/app_a/environments/staging/buckets"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "data": [{
-                "id": "assets", "name": "Assets", "write_access": "open", "revision": 1, "entry_count": 0, "release_count": 0,
+                "id": "assets", "name": "Assets", "write_access": "open", "private": false, "revision": 1, "entry_count": 0, "release_count": 0,
                 "unreleased_count": 4, "tags": [],
             }]})))
             .mount(&server)

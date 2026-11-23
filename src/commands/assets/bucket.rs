@@ -27,6 +27,7 @@ pub(super) async fn list(args: ListArgs, output: Output) -> anyhow::Result<()> {
                     "name": bucket.name,
                     "environment": { "id": environment.id, "name": environment.name },
                     "write_access": bucket.write_access,
+                    "private": bucket.private,
                     "max_file_size_bytes": bucket.limits.max_file_size_bytes,
                     "allowed_content_types": bucket.limits.allowed_content_types,
                     "release_count": bucket.release_count,
@@ -47,7 +48,7 @@ pub(super) async fn list(args: ListArgs, output: Output) -> anyhow::Result<()> {
         );
         return Ok(());
     }
-    let rows: Vec<[String; 7]> = buckets
+    let rows: Vec<[String; 8]> = buckets
         .iter()
         .map(|(environment, bucket)| {
             let write = match bucket.write_access.as_str() {
@@ -63,6 +64,7 @@ pub(super) async fn list(args: ListArgs, output: Output) -> anyhow::Result<()> {
                 environment.id.clone(),
                 bucket.id.clone(),
                 write,
+                if bucket.private { "private" } else { "public" }.to_string(),
                 match bucket.limits.max_file_size_bytes {
                     Some(bytes) => HumanBytes(bytes).to_string(),
                     None => "none".to_string(),
@@ -80,6 +82,7 @@ pub(super) async fn list(args: ListArgs, output: Output) -> anyhow::Result<()> {
         "ENV",
         "BUCKET",
         "WRITE",
+        "PRIVACY",
         "MAX FILE SIZE",
         "TYPES",
         "UNRELEASED",
